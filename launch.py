@@ -5,8 +5,9 @@ url = "http://127.0.0.1:5000/answer"
 #url = "http://127.0.0.1:5000/retrieve"
 
 payload = {
-    "query": "According to the scope of the BREF, what are the specific energy and power thresholds that define the coverage of smitheries?",
-    "llm_id": "ollama:llama3.2"
+    "query": "What are the reported 'cross-media effects' of using 'wet scrubbers' for dust capture in cupola systems compared to dry systems?",
+#    "llm_id": "ollama:llama3.2"
+    "llm_id": "openai:gpt-4o-mini"
 }
 
 r = requests.post(url, json=payload, timeout=120)

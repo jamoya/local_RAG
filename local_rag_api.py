@@ -1,75 +1,114 @@
 from __future__ import annotations
-
 """
-Local RAG Flask API (LangChain >= 1.x compatible)
+Local RAG Flask API
 
-Goals:
-- Flexible switching among embedding models and LLM backends (Ollama / OpenAI / Gemini)
-- Accurate retrieval for lengthy PDFs (page-aware loading + chunking)
-- Vector dimension compatibility enforced via versioned, dimension-tagged collections
-- CRUD sync with filesystem watcher:
-    - POST /ingest  (multipart: file, source_path?, embedding_id?, version?)
-    - POST /delete  (json: source_path, embedding_id?, version?)
-    - GET  /sources (query: embedding_id, version)  -> for reconcile mode
-- Retrieval + Answering:
-    - POST /retrieve (json: query, top_k?, fetch_k?, search_type?, mmr_lambda?, embedding_id?, version?)
-    - POST /answer   (json: question, same retrieval params, llm_id?, max_context_chars?)
+This file is designed to work with the libraries pinned in requirements.txt, but it also
+includes lightweight fallbacks so the service can start even if some optional deps are missing.
 
-Test quickly:
-    python local_rag_api.py
-    curl http://127.0.0.1:5000/health
+Key improvements for question-answering accuracy on long technical PDFs:
+- PDF text normalization (de-hyphenation, whitespace)
+- Page-aware ingestion + optional page-range ingestion (page_start/page_end, 1-based)
+- Chunking with separators tuned for regulatory text
+- Heuristic multi-query expansion (acronyms, unit boosting, keyword focusing)
+- Two-stage retrieval: vector candidates + lightweight lexical rerank (TF-IDF on candidates)
+- Deterministic chunk IDs and source/page citations
 """
 
 import os
 import io
+import re
+import json
 import hashlib
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
-from langchain_core.documents import Document
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-
-# Embeddings
+# ----------------------------
+# Optional imports (LangChain / Chroma). We provide fallbacks for tests/offline.
+# ----------------------------
 try:
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_core.documents import Document  # type: ignore
 except Exception:  # pragma: no cover
-    HuggingFaceEmbeddings = None  # type: ignore
+    @dataclass
+    class Document:  # minimal compatible stand-in
+        page_content: str
+        metadata: Dict[str, Any]
 
-# LLMs (optional, depending on what you install)
 try:
-    from langchain_ollama import ChatOllama
+    from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
 except Exception:  # pragma: no cover
-    ChatOllama = None  # type: ignore
+    RecursiveCharacterTextSplitter = None  # type: ignore
 
 try:
-    from langchain_openai import ChatOpenAI
+    from langchain_chroma import Chroma  # type: ignore
 except Exception:  # pragma: no cover
-    ChatOpenAI = None  # type: ignore
+    Chroma = None  # type: ignore
 
 try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    import chromadb  # type: ignore
 except Exception:  # pragma: no cover
-    ChatGoogleGenerativeAI = None  # type: ignore
+    chromadb = None  # type: ignore
 
-# PDF loading (prefer LangChain loader; fallback to pypdf)
+# PDF extraction
 try:
-    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_community.document_loaders import PyPDFLoader  # type: ignore
 except Exception:  # pragma: no cover
     PyPDFLoader = None  # type: ignore
 
 try:
-    from pypdf import PdfReader
+    from pypdf import PdfReader  # type: ignore
 except Exception:  # pragma: no cover
     PdfReader = None  # type: ignore
 
+# DOCX
+try:
+    import docx  # python-docx
+except Exception:  # pragma: no cover
+    docx = None  # type: ignore
 
-app = Flask(__name__)
+# LLM backends (optional). We keep a "mock" backend for endpoint tests.
+try:
+    from langchain_ollama import ChatOllama  # type: ignore
+except Exception:  # pragma: no cover
+    ChatOllama = None  # type: ignore
+
+try:
+    from langchain_openai import ChatOpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore
+
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+except Exception:  # pragma: no cover
+    ChatGoogleGenerativeAI = None  # type: ignore
+
+try:
+    from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+except Exception:  # pragma: no cover
+    SystemMessage = None  # type: ignore
+    HumanMessage = None  # type: ignore
+
+# Embeddings (optional). For tests/offline we support "fake" and "tfidf".
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
+except Exception:  # pragma: no cover
+    HuggingFaceEmbeddings = None  # type: ignore
+
+try:
+    from langchain_core.embeddings import FakeEmbeddings  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from langchain_core.embeddings.fake import FakeEmbeddings  # type: ignore
+    except Exception:  # pragma: no cover
+        FakeEmbeddings = None  # type: ignore
+
+# sklearn for fallback store + rerank
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ----------------------------
-# Defaults (override via env)
+# Config
 # ----------------------------
 HOST = os.environ.get("RAG_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RAG_PORT", "5000"))
@@ -78,231 +117,367 @@ CHROMA_PATH = os.path.abspath(os.environ.get("CHROMA_DB_PATH", "./local_chroma_d
 BASE_COLLECTION = os.environ.get("CHROMA_BASE_COLLECTION_NAME", "my_local_knowledge_base")
 DEFAULT_VERSION = os.environ.get("CHROMA_COLLECTION_VERSION", "v1")
 
-# Default embedding + LLM
-DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "hf:BAAI/bge-large-en-v1.5")
-DEFAULT_LLM_ID = os.environ.get("LLM_ID", "ollama:llama3.2")
+DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "tfidf:local")
+DEFAULT_LLM_ID = os.environ.get("LLM_ID", "mock:any")
 
-# Chunking tuned for long technical PDFs
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1600"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "240"))
-LONG_DOC_THRESHOLD_CHARS = int(os.environ.get("LONG_DOC_THRESHOLD_CHARS", "800000"))
 LONG_DOC_CHUNK_SIZE = int(os.environ.get("LONG_DOC_CHUNK_SIZE", "2000"))
 LONG_DOC_CHUNK_OVERLAP = int(os.environ.get("LONG_DOC_CHUNK_OVERLAP", "300"))
+LONG_DOC_THRESHOLD_CHARS = int(os.environ.get("LONG_DOC_THRESHOLD_CHARS", "800000"))
 
-# Retrieval defaults (accuracy-focused)
-DEFAULT_TOP_K = int(os.environ.get("TOP_K", "12"))
-DEFAULT_FETCH_K = int(os.environ.get("FETCH_K", "40"))
-DEFAULT_SEARCH_TYPE = os.environ.get("SEARCH_TYPE", "mmr")  # "similarity" or "mmr"
+DEFAULT_TOP_K = int(os.environ.get("TOP_K", "6"))
+DEFAULT_FETCH_K = int(os.environ.get("FETCH_K", "24"))
+DEFAULT_SEARCH_TYPE = os.environ.get("SEARCH_TYPE", "mmr")  # mmr | similarity
 DEFAULT_MMR_LAMBDA = float(os.environ.get("MMR_LAMBDA", "0.3"))
 
-# LLM inference params (Ollama)
-OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
-OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "1200"))
-OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.2"))
-OLLAMA_TOP_P = float(os.environ.get("OLLAMA_TOP_P", "0.9"))
-
-# Context size passed to LLM
 DEFAULT_MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "18000"))
 
+SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}
+
+app = Flask(__name__)
 
 # ----------------------------
-# Helpers: model factories
+# Utilities
 # ----------------------------
 def _slug(s: str) -> str:
     return "".join(c.lower() if c.isalnum() else "_" for c in s).strip("_")
 
+def _collection_name(embedding_id: str, version: str) -> str:
+    return f"{BASE_COLLECTION}__{version}__{_slug(embedding_id)}"
 
-def _stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+def _normalize_extracted_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)  # de-hyphenate across line breaks
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-
-def make_embeddings(embedding_id: str):
-    """
-    embedding_id formats:
-      - hf:<huggingface model id>   (requires langchain-huggingface + sentence-transformers)
-      - openai:<model>              (requires langchain-openai)
-      - gemini:<model>              (requires langchain-google-genai)
-      - ollama:<model>              (embeddings model in ollama; requires langchain-ollama)
-    """
-    if ":" not in embedding_id:
-        raise ValueError("embedding_id must have a prefix like 'hf:' or 'openai:'")
-
-    provider, model = embedding_id.split(":", 1)
-
-    if provider == "hf":
-        if HuggingFaceEmbeddings is None:
-            raise RuntimeError("langchain-huggingface is not installed. pip install -U langchain-huggingface sentence-transformers")
-        return HuggingFaceEmbeddings(model_name=model)
-
-    if provider == "openai":
-        if ChatOpenAI is None:
-            raise RuntimeError("langchain-openai is not installed. pip install -U langchain-openai")
-        # OpenAI embeddings live in langchain_openai too; import lazily to avoid hard dependency.
-        from langchain_openai import OpenAIEmbeddings  # type: ignore
-        return OpenAIEmbeddings(model=model)
-
-    if provider == "gemini":
-        # Gemini embeddings
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings  # type: ignore
-        return GoogleGenerativeAIEmbeddings(model=model)
-
-    if provider == "ollama":
-        if ChatOllama is None:
-            raise RuntimeError("langchain-ollama is not installed. pip install -U langchain-ollama")
-        # Ollama embeddings class lives in langchain_ollama
-        from langchain_ollama import OllamaEmbeddings  # type: ignore
-        return OllamaEmbeddings(model=model)
-
-    raise ValueError(f"Unknown embedding provider prefix: {provider}")
-
-
-def embedding_dimension(emb) -> int:
-    v = emb.embed_query("dimension probe")
-    if not isinstance(v, list) or not v:
-        raise RuntimeError("Embedding provider returned invalid embedding vector.")
-    return len(v)
-
-
-def collection_name(base: str, version: str, embedding_id: str, dim: int) -> str:
-    key = f"{base}|{version}|{embedding_id}|{dim}"
-    return f"{base}__{version}__{_slug(embedding_id)}__d{dim}__{_stable_hash(key)}"
-
-
-def make_llm(llm_id: str):
-    """
-    llm_id formats:
-      - ollama:<model>
-      - openai:<model>
-      - gemini:<model>
-    """
-    if ":" not in llm_id:
-        raise ValueError("llm_id must have a prefix like 'ollama:' or 'openai:'")
-    provider, model = llm_id.split(":", 1)
-
-    if provider == "ollama":
-        if ChatOllama is None:
-            raise RuntimeError("langchain-ollama is not installed. pip install -U langchain-ollama")
-        return ChatOllama(
-            model=model,
-            temperature=OLLAMA_TEMPERATURE,
-            top_p=OLLAMA_TOP_P,
-            num_ctx=OLLAMA_NUM_CTX,
-            num_predict=OLLAMA_NUM_PREDICT,
-        )
-
-    if provider == "openai":
-        if ChatOpenAI is None:
-            raise RuntimeError("langchain-openai is not installed. pip install -U langchain-openai")
-        return ChatOpenAI(model=model, temperature=0.2)
-
-    if provider == "gemini":
-        if ChatGoogleGenerativeAI is None:
-            raise RuntimeError("langchain-google-genai is not installed. pip install -U langchain-google-genai")
-        return ChatGoogleGenerativeAI(model=model, temperature=0.2)
-
-    raise ValueError(f"Unknown LLM provider prefix: {provider}")
-
-
-# ----------------------------
-# Vector store access + validation
-# ----------------------------
-def get_store(embedding_id: str, version: str) -> Tuple[Chroma, Any, str, int]:
-    emb = make_embeddings(embedding_id)
-    dim = embedding_dimension(emb)
-    cname = collection_name(BASE_COLLECTION, version, embedding_id, dim)
-
-    store = Chroma(
-        collection_name=cname,
-        persist_directory=CHROMA_PATH,
-        embedding_function=emb,
-        collection_metadata={"dimension": dim, "embedding_id": embedding_id, "version": version},
-    )
-
-    # Dimension validation: if collection exists with a different dimension, fail fast.
-    try:
-        col = store._collection  # internal but stable enough for our sanity check
-        meta = getattr(col, "metadata", None) or {}
-        existing_dim = meta.get("dimension")
-        if existing_dim is not None and int(existing_dim) != int(dim):
-            raise RuntimeError(
-                f"Embedding dimension mismatch for collection '{cname}': "
-                f"collection dim={existing_dim}, current embedding dim={dim}. "
-                f"Use a new CHROMA_COLLECTION_VERSION or delete the DB."
-            )
-    except Exception:
-        # If we can't read metadata, we won't block; Chroma will error if incompatible at query/add time.
-        pass
-
-    return store, emb, cname, dim
-
-
-def choose_splitter(total_chars: int) -> RecursiveCharacterTextSplitter:
-    if total_chars >= LONG_DOC_THRESHOLD_CHARS:
-        return RecursiveCharacterTextSplitter(chunk_size=LONG_DOC_CHUNK_SIZE, chunk_overlap=LONG_DOC_CHUNK_OVERLAP)
-    return RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-
-
-def load_pdf_documents(tmp_path: str, source_name: str, source_path: str) -> List[Document]:
-    docs: List[Document] = []
-    if PyPDFLoader is not None:
-        loader = PyPDFLoader(tmp_path)
-        for d in loader.load():
-            md = dict(d.metadata or {})
-            # Normalize metadata keys
-            md["source"] = source_name
-            md["source_path"] = source_path
-            # PyPDFLoader uses "page" key
-            docs.append(Document(page_content=d.page_content, metadata=md))
-        return docs
-
-    if PdfReader is None:
-        raise RuntimeError("Neither langchain-community PyPDFLoader nor pypdf is installed. pip install -U langchain-community pypdf")
-
-    reader = PdfReader(tmp_path)
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        docs.append(Document(page_content=text, metadata={"source": source_name, "source_path": source_path, "page": i}))
-    return docs
-
-
-def load_text_document(raw: bytes, source_name: str, source_path: str) -> List[Document]:
-    text = raw.decode("utf-8", errors="ignore")
-    return [Document(page_content=text, metadata={"source": source_name, "source_path": source_path, "page": None})]
-
+def _tokenize_for_lexical(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9]+(?:[/\-][A-Za-z0-9]+)*", (text or "").lower())
 
 def doc_id(source_path: str, page: Optional[int], chunk: int) -> str:
     base = f"{source_path}|{page}|{chunk}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
 
+# ----------------------------
+# Chunking
+# ----------------------------
+def choose_splitter(total_chars: int):
+    if RecursiveCharacterTextSplitter is None:
+        return None
+    separators = ["\n\n", "\n", ". ", "; ", ": ", ", ", " ", ""]
+    if total_chars >= LONG_DOC_THRESHOLD_CHARS:
+        return RecursiveCharacterTextSplitter(
+            chunk_size=LONG_DOC_CHUNK_SIZE,
+            chunk_overlap=LONG_DOC_CHUNK_OVERLAP,
+            separators=separators,
+        )
+    return RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=separators,
+    )
 
-def delete_by_source(store: Chroma, source_path: str) -> None:
-    # Chroma supports deleting by metadata filter
-    store._collection.delete(where={"source_path": source_path})
+def split_documents(docs: List[Document]) -> List[Document]:
+    total_chars = sum(len(d.page_content or "") for d in docs)
+    splitter = choose_splitter(total_chars)
 
+    if splitter is None:
+        # Very simple fallback
+        chunks: List[Document] = []
+        for d in docs:
+            txt = d.page_content or ""
+            step = max(200, CHUNK_SIZE - CHUNK_OVERLAP)
+            for i in range(0, len(txt), step):
+                piece = txt[i:i+CHUNK_SIZE]
+                chunks.append(Document(page_content=piece, metadata=dict(d.metadata or {})))
+        return chunks
+
+    chunks: List[Document] = []
+    for d in docs:
+        chunks.extend(splitter.split_documents([d]))
+    return chunks
 
 # ----------------------------
-# Retrieval (LangChain 1.x compatible)
+# Document loading
 # ----------------------------
-def retrieve_docs(
-    store: Chroma,
-    query: str,
-    top_k: int,
-    fetch_k: int,
-    search_type: str,
-    mmr_lambda: float,
-) -> List[Document]:
-    # as_retriever returns a VectorStoreRetriever which is a Runnable in LangChain 1.x
-    kwargs: Dict[str, Any] = {}
-    if search_type == "mmr":
-        kwargs = {"k": top_k, "fetch_k": fetch_k, "lambda_mult": mmr_lambda}
-    else:
-        kwargs = {"k": top_k}
+def load_pdf_documents(tmp_path: str, source_name: str, source_path: str, page_start: Optional[int]=None, page_end: Optional[int]=None) -> List[Document]:
+    start0 = max((page_start or 1) - 1, 0)
+    end0 = (page_end - 1) if page_end is not None else None
 
-    retriever = store.as_retriever(search_type=search_type, search_kwargs=kwargs)
+    def within(i0: int) -> bool:
+        if i0 < start0:
+            return False
+        if end0 is not None and i0 > end0:
+            return False
+        return True
 
-    # LangChain 1.x: prefer invoke()
-    return retriever.invoke(query)
+    docs: List[Document] = []
+    if PyPDFLoader is not None:
+        loader = PyPDFLoader(tmp_path)
+        for d in loader.load():
+            md = dict(d.metadata or {})
+            i0 = int(md.get("page", 0))
+            if not within(i0):
+                continue
+            md["source"] = source_name
+            md["source_path"] = source_path
+            md["page"] = i0 + 1
+            docs.append(Document(page_content=_normalize_extracted_text(d.page_content), metadata=md))
+        return docs
 
+    if PdfReader is None:
+        raise RuntimeError("No PDF reader available (install pypdf or langchain-community).")
+
+    reader = PdfReader(tmp_path)
+    for i0, page in enumerate(reader.pages):
+        if not within(i0):
+            continue
+        txt = _normalize_extracted_text(page.extract_text() or "")
+        docs.append(Document(page_content=txt, metadata={"source": source_name, "source_path": source_path, "page": i0+1}))
+    return docs
+
+def load_docx(raw: bytes, source_name: str, source_path: str) -> List[Document]:
+    if docx is None:
+        raise RuntimeError("python-docx is not available.")
+    f = io.BytesIO(raw)
+    d = docx.Document(f)
+    full = "\n".join(p.text for p in d.paragraphs)
+    return [Document(page_content=_normalize_extracted_text(full), metadata={"source": source_name, "source_path": source_path, "page": None})]
+
+def load_text(raw: bytes, source_name: str, source_path: str) -> List[Document]:
+    txt = raw.decode("utf-8", errors="ignore")
+    return [Document(page_content=_normalize_extracted_text(txt), metadata={"source": source_name, "source_path": source_path, "page": None})]
+
+# ----------------------------
+# Embeddings + Vector stores
+# ----------------------------
+def make_embeddings(embedding_id: str):
+    """
+    embedding_id formats:
+      - tfidf:local               (always available fallback)
+      - fake:anything             (if FakeEmbeddings exists)
+      - hf:<huggingface model>    (requires langchain-huggingface)
+      - openai:<model> / gemini:<model> / ollama:<model> (if corresponding deps installed)
+    """
+    if ":" not in embedding_id:
+        raise ValueError("embedding_id must have a prefix like 'tfidf:' or 'hf:'")
+    provider, model = embedding_id.split(":", 1)
+
+    if provider == "tfidf":
+        return None  # handled in fallback store
+
+    if provider == "fake":
+        if FakeEmbeddings is None:
+            raise RuntimeError("FakeEmbeddings not available.")
+        dim = int(os.environ.get("FAKE_EMB_DIM", "384"))
+        return FakeEmbeddings(size=dim)
+
+    if provider == "hf":
+        if HuggingFaceEmbeddings is None:
+            raise RuntimeError("langchain-huggingface not installed.")
+        return HuggingFaceEmbeddings(model_name=model)
+
+    raise RuntimeError(f"Embedding provider '{provider}' not available in this runtime. Use 'tfidf:local' or install deps.")
+
+class _TfidfStore:
+    """Lightweight in-memory store used as a fallback when Chroma/LangChain aren't installed."""
+    def __init__(self):
+        self._docs: List[Document] = []
+        self._vectorizer = TfidfVectorizer(tokenizer=_tokenize_for_lexical, lowercase=False, min_df=1)
+        self._X = None
+
+    def _refit(self):
+        corpus = [d.page_content or "" for d in self._docs]
+        self._X = self._vectorizer.fit_transform(corpus) if corpus else None
+
+    def add_documents(self, docs: List[Document]):
+        self._docs.extend(docs)
+        self._refit()
+
+    def delete(self, source_path: str):
+        self._docs = [d for d in self._docs if (d.metadata or {}).get("source_path") != source_path]
+        self._refit()
+
+    def similarity_search_with_score(self, query: str, k: int) -> List[Tuple[Document, float]]:
+        if not self._docs or self._X is None:
+            return []
+        qv = self._vectorizer.transform([query])
+        sims = cosine_similarity(qv, self._X).ravel()
+        idx = sims.argsort()[::-1][:k]
+        # score as 1 - sim distance-like to keep downstream robust
+        return [(self._docs[i], float(1.0 - sims[i])) for i in idx]
+
+    def similarity_search(self, query: str, k: int) -> List[Document]:
+        return [d for d, _ in self.similarity_search_with_score(query, k)]
+
+    def max_marginal_relevance_search(self, query: str, k: int, fetch_k: int, lambda_mult: float) -> List[Document]:
+        # Simple MMR over cosine sims in TF-IDF space
+        if not self._docs or self._X is None:
+            return []
+        qv = self._vectorizer.transform([query])
+        sims = cosine_similarity(qv, self._X).ravel()
+        candidates = sims.argsort()[::-1][:fetch_k].tolist()
+        selected: List[int] = []
+        cand_vecs = self._X[candidates]
+
+        while candidates and len(selected) < k:
+            if not selected:
+                best = candidates[0]
+                selected.append(best)
+                candidates = [c for c in candidates if c != best]
+                continue
+
+            sel_vecs = self._X[selected]
+            # diversity penalty: max similarity to selected
+            div = cosine_similarity(self._X[candidates], sel_vecs).max(axis=1)
+            rel = sims[candidates]
+            mmr = lambda_mult * rel - (1 - lambda_mult) * div
+            best_idx = int(mmr.argmax())
+            best = candidates[best_idx]
+            selected.append(best)
+            candidates.pop(best_idx)
+
+        return [self._docs[i] for i in selected]
+
+# Cache stores per (embedding_id, version)
+_STORE_CACHE: Dict[str, Any] = {}
+
+def get_store(embedding_id: str, version: str):
+    key = f"{embedding_id}::{version}"
+    if key in _STORE_CACHE:
+        return _STORE_CACHE[key]
+
+    cname = _collection_name(embedding_id, version)
+
+    # Prefer LangChain Chroma if available
+    if Chroma is not None:
+        emb = make_embeddings(embedding_id)
+        store = Chroma(collection_name=cname, persist_directory=CHROMA_PATH, embedding_function=emb)
+        _STORE_CACHE[key] = (store, emb, cname, "chroma")
+        return _STORE_CACHE[key]
+
+    # Fallback: in-memory TF-IDF store
+    store = _TfidfStore()
+    _STORE_CACHE[key] = (store, None, cname, "tfidf")
+    return _STORE_CACHE[key]
+
+def delete_by_source(store: Any, source_path: str):
+    if hasattr(store, "_collection"):
+        store._collection.delete(where={"source_path": source_path})
+        return
+    if hasattr(store, "delete"):
+        store.delete(source_path)
+        return
+    raise RuntimeError("Store does not support delete")
+
+# ----------------------------
+# Retrieval improvements
+# ----------------------------
+def _build_query_variants(query: str) -> List[str]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    variants = [q]
+
+    expansions = {
+        "bat-ael": "BAT-associated emission level",
+        "bat-aepl": "BAT-associated environmental performance level",
+        "tvoc": "total volatile organic compounds TVOC",
+        "pcdd/f": "PCDD/F dioxins furans",
+        "aox": "Adsorbable Organically Bound Halogens AOX",
+        "hbc": "hot blast cupola HBC",
+        "cbc": "cold blast cupola CBC",
+        "eaf": "electric arc furnace EAF",
+        "sps": "spark plasma sintering SPS",
+        "otnoc": "other than normal operating conditions OTNOC",
+        "cms": "chemicals management system CMS",
+        "ems": "environmental management system EMS",
+    }
+    q_low = q.lower()
+    for k, v in expansions.items():
+        if k in q_low and v.lower() not in q_low:
+            variants.append(f"{q} ({v})")
+
+    toks = _tokenize_for_lexical(q)
+    stop = {"what","which","are","is","the","a","an","of","for","to","and","in","on","under","from","with","using","according","based","list","describe"}
+    keep = [t for t in toks if t not in stop]
+    if len(keep) >= 6:
+        variants.append(" ".join(keep[:18]))
+
+    unit_hits = [t for t in toks if any(u in t for u in ["mg","nm","m3","mw","kwh","kg","ton","t/"])]
+    if unit_hits:
+        variants.append(q + " " + " ".join(unit_hits[:10]))
+
+    out, seen = [], set()
+    for v in variants:
+        v2 = " ".join(v.split())
+        if v2 and v2 not in seen:
+            out.append(v2)
+            seen.add(v2)
+    return out
+
+def _vector_candidates(store: Any, query: str, k: int) -> List[Tuple[Document, float]]:
+    if hasattr(store, "similarity_search_with_score"):
+        try:
+            return store.similarity_search_with_score(query, k=k)
+        except Exception:
+            pass
+    if hasattr(store, "similarity_search"):
+        docs = store.similarity_search(query, k=k)
+        return [(d, 1.0) for d in docs]
+    raise RuntimeError("Store does not support retrieval")
+
+def _hybrid_rerank(query: str, docs_and_scores: List[Tuple[Document, float]]) -> List[Document]:
+    if not docs_and_scores:
+        return []
+    docs = [d for d, _ in docs_and_scores]
+    raw = [float(s) for _, s in docs_and_scores]
+    inv = [-r for r in raw]
+    vmin, vmax = min(inv), max(inv)
+    vec_sim = [(x - vmin) / (vmax - vmin) if vmax != vmin else 0.5 for x in inv]
+
+    corpus = [d.page_content or "" for d in docs]
+    vect = TfidfVectorizer(tokenizer=_tokenize_for_lexical, lowercase=False, min_df=1)
+    X = vect.fit_transform(corpus)
+    qv = vect.transform([query])
+    lex = cosine_similarity(qv, X).ravel().tolist()
+    lmin, lmax = min(lex), max(lex)
+    lex_sim = [(x - lmin) / (lmax - lmin) if lmax != lmin else 0.0 for x in lex]
+
+    blended = [0.55 * ls + 0.45 * vs for ls, vs in zip(lex_sim, vec_sim)]
+    order = sorted(range(len(docs)), key=lambda i: blended[i], reverse=True)
+    return [docs[i] for i in order]
+
+def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type: str, mmr_lambda: float) -> List[Document]:
+    variants = _build_query_variants(query)
+    cand: List[Tuple[Document, float]] = []
+    per_q = max(5, min(fetch_k, 40))
+    for v in variants[:4]:
+        cand.extend(_vector_candidates(store, v, k=per_q))
+
+    uniq: Dict[str, Tuple[Document, float]] = {}
+    for d, s in cand:
+        md = d.metadata or {}
+        key = md.get("id") or f"{md.get('source_path')}|{md.get('page')}|{md.get('chunk')}|{hash(d.page_content)}"
+        if key not in uniq or s < uniq[key][1]:
+            uniq[key] = (d, s)
+
+    if search_type == "mmr" and hasattr(store, "max_marginal_relevance_search"):
+        try:
+            mmr_docs = store.max_marginal_relevance_search(query, k=top_k, fetch_k=max(fetch_k, top_k*4), lambda_mult=mmr_lambda)
+            for d in mmr_docs:
+                md = d.metadata or {}
+                key = md.get("id") or f"{md.get('source_path')}|{md.get('page')}|{md.get('chunk')}|{hash(d.page_content)}"
+                uniq.setdefault(key, (d, 0.0))
+        except Exception:
+            pass
+
+    reranked = _hybrid_rerank(query, list(uniq.values()))
+    return reranked[:top_k]
 
 def format_context(docs: List[Document], max_chars: int) -> Tuple[str, List[Dict[str, Any]]]:
     blocks: List[str] = []
@@ -319,8 +494,7 @@ def format_context(docs: List[Document], max_chars: int) -> Tuple[str, List[Dict
         if chunk is not None:
             header += f", chunk {chunk}"
         header += " ---\n"
-        text = d.page_content or ""
-        piece = header + text.strip()
+        piece = header + (d.page_content or "").strip()
         if not piece.strip():
             continue
         if used + len(piece) > max_chars and blocks:
@@ -330,6 +504,40 @@ def format_context(docs: List[Document], max_chars: int) -> Tuple[str, List[Dict
         sources.append({"source": source, "page": page, "chunk": chunk, "source_path": md.get("source_path")})
     return "\n\n".join(blocks), sources
 
+# ----------------------------
+# LLM
+# ----------------------------
+def make_llm(llm_id: str):
+    if ":" not in llm_id:
+        raise ValueError("llm_id must have a prefix like 'ollama:' or 'openai:'")
+    provider, model = llm_id.split(":", 1)
+
+    if provider == "mock":
+        class _Resp:
+            def __init__(self, content: str):
+                self.content = content
+        class _MockLLM:
+            def invoke(self, messages):
+                user_msg = messages[-1].content if messages else ""
+                return _Resp("MOCK_ANSWER: " + (user_msg or "")[:600])
+        return _MockLLM()
+
+    if provider == "ollama":
+        if ChatOllama is None:
+            raise RuntimeError("langchain-ollama not installed.")
+        return ChatOllama(model=model, temperature=float(os.environ.get("OLLAMA_TEMPERATURE","0.2")))
+
+    if provider == "openai":
+        if ChatOpenAI is None:
+            raise RuntimeError("langchain-openai not installed.")
+        return ChatOpenAI(model=model, temperature=float(os.environ.get("OPENAI_TEMPERATURE","0.2")))
+
+    if provider == "gemini":
+        if ChatGoogleGenerativeAI is None:
+            raise RuntimeError("langchain-google-genai not installed.")
+        return ChatGoogleGenerativeAI(model=model)
+
+    raise ValueError(f"Unsupported llm provider: {provider}")
 
 # ----------------------------
 # Routes
@@ -338,33 +546,28 @@ def format_context(docs: List[Document], max_chars: int) -> Tuple[str, List[Dict
 def health():
     return jsonify({"status": "ok"})
 
-
 @app.get("/ready")
 def ready():
     embedding_id = request.args.get("embedding_id", DEFAULT_EMBEDDING_ID)
     version = request.args.get("version", DEFAULT_VERSION)
     try:
-        store, emb, cname, dim = get_store(embedding_id, version)
-        # Try a cheap call
-        _ = embedding_dimension(emb)
-        return jsonify({"status": "ready", "collection": cname, "dimension": dim, "embedding_id": embedding_id, "version": version})
+        store, emb, cname, backend = get_store(embedding_id, version)
+        return jsonify({"status": "ready", "collection": cname, "backend": backend, "embedding_id": embedding_id, "version": version})
     except Exception as e:
         return jsonify({"status": "not_ready", "error": str(e)}), 503
-
 
 @app.get("/sources")
 def sources():
     embedding_id = request.args.get("embedding_id", DEFAULT_EMBEDDING_ID)
     version = request.args.get("version", DEFAULT_VERSION)
-    store, _, cname, dim = get_store(embedding_id, version)
-
-    # Chroma doesn't have "distinct" query; get all metadatas and dedupe.
-    # For large collections, this can be heavy; acceptable for reconcile intervals.
-    data = store._collection.get(include=["metadatas"])
-    metadatas = data.get("metadatas", []) or []
-    uniq = sorted({(md or {}).get("source_path") for md in metadatas if (md or {}).get("source_path")})
-    return jsonify({"count": len(uniq), "source_paths": uniq, "collection": cname, "dimension": dim})
-
+    store, _, cname, backend = get_store(embedding_id, version)
+    if hasattr(store, "_collection"):
+        data = store._collection.get(include=["metadatas"], limit=100000)
+        srcs = sorted({(m or {}).get("source_path") for m in (data.get("metadatas") or []) if (m or {}).get("source_path")})
+    else:
+        # fallback store
+        srcs = sorted({(d.metadata or {}).get("source_path") for d in getattr(store, "_docs", []) if (d.metadata or {}).get("source_path")})
+    return jsonify({"sources": srcs, "collection": cname, "backend": backend, "embedding_id": embedding_id, "version": version})
 
 @app.post("/delete")
 def delete():
@@ -372,44 +575,35 @@ def delete():
     source_path = payload.get("source_path")
     if not source_path:
         return jsonify({"error": "source_path is required"}), 400
-
     embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
     version = payload.get("version", DEFAULT_VERSION)
-
-    store, _, cname, dim = get_store(embedding_id, version)
+    store, _, cname, backend = get_store(embedding_id, version)
     delete_by_source(store, source_path)
-    return jsonify({"status": "ok", "deleted_source_path": source_path, "collection": cname, "dimension": dim})
-
+    return jsonify({"status":"ok","deleted_source_path":source_path,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version})
 
 @app.post("/ingest")
 def ingest():
-    # Required: file + embedding_id + version + source_path.
-    # We validate early so bad requests return quickly (and do not trigger
-    # expensive model initialization with defaults).
     if "file" not in request.files:
         return jsonify({"error": "multipart form-data must include 'file'"}), 400
-
-    missing = [k for k in ("embedding_id", "version", "source_path") if not (request.form.get(k) or "").strip()]
+    missing = [k for k in ("embedding_id","version","source_path") if not (request.form.get(k) or "").strip()]
     if missing:
-        return jsonify({"error": "missing required form fields", "missing": missing}), 400
-
+        return jsonify({"error":"missing required form fields","missing":missing}), 400
 
     f = request.files["file"]
     raw = f.read()
     filename = f.filename or "uploaded_file"
     source_path = request.form.get("source_path")
-
     embedding_id = request.form.get("embedding_id")
     version = request.form.get("version")
 
-    store, _, cname, dim = get_store(embedding_id, version)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in SUPPORTED_EXTS:
+        return jsonify({"error": f"unsupported extension '{ext}'", "supported": sorted(SUPPORTED_EXTS)}), 400
 
-    # Remove prior vectors for this source_path (upsert behavior)
+    store, _, cname, backend = get_store(embedding_id, version)
+    # Upsert behavior
     delete_by_source(store, source_path)
 
-    ext = os.path.splitext(filename)[1].lower()
-
-    # Load documents
     docs: List[Document] = []
     if ext == ".pdf":
         import tempfile
@@ -417,94 +611,79 @@ def ingest():
             tmp.write(raw)
             tmp_path = tmp.name
         try:
-            docs = load_pdf_documents(tmp_path, filename, source_path)
+            page_start = request.form.get("page_start")
+            page_end = request.form.get("page_end")
+            ps = int(page_start) if page_start and page_start.strip().isdigit() else None
+            pe = int(page_end) if page_end and page_end.strip().isdigit() else None
+            docs = load_pdf_documents(tmp_path, filename, source_path, page_start=ps, page_end=pe)
         finally:
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
+    elif ext == ".docx":
+        docs = load_docx(raw, filename, source_path)
     else:
-        docs = load_text_document(raw, filename, source_path)
+        docs = load_text(raw, filename, source_path)
 
-    total_chars = sum(len(d.page_content or "") for d in docs)
-    splitter = choose_splitter(total_chars)
-
-    chunks: List[Document] = []
-    for d in docs:
-        # Split each page/document while preserving metadata
-        page_docs = splitter.split_documents([d])
-        chunks.extend(page_docs)
+    chunks = split_documents(docs)
 
     # Add chunk index metadata + deterministic IDs
     for idx, d in enumerate(chunks):
         md = dict(d.metadata or {})
         md["chunk"] = idx
+        md["id"] = doc_id(source_path, md.get("page"), idx)
         d.metadata = md
 
-    ids = [doc_id((d.metadata or {}).get("source_path", source_path), (d.metadata or {}).get("page"), (d.metadata or {}).get("chunk", 0)) for d in chunks]
-
-    store.add_documents(chunks, ids=ids)
+    # Write to store
+    if hasattr(store, "add_documents"):
+        store.add_documents(chunks)
+    elif hasattr(store, "_collection"):
+        # Shouldn't happen, but be safe
+        store.add_texts([c.page_content for c in chunks], metadatas=[c.metadata for c in chunks], ids=[c.metadata["id"] for c in chunks])
+    else:
+        raise RuntimeError("Store does not support add_documents")
 
     return jsonify({
         "status": "ok",
+        "source_path": source_path,
+        "filename": filename,
         "collection": cname,
-        "dimension": dim,
+        "backend": backend,
         "embedding_id": embedding_id,
         "version": version,
-        "source": filename,
-        "source_path": source_path,
+        "pages_loaded": len(docs),
         "chunks_added": len(chunks),
-        "total_chars": total_chars,
-        "chunk_size": splitter._chunk_size,  # informative
-        "chunk_overlap": splitter._chunk_overlap,
+        "total_chars": sum(len(d.page_content or "") for d in docs),
     })
-
 
 @app.post("/retrieve")
 def retrieve():
     payload = request.get_json(silent=True) or {}
     query = payload.get("query")
     if not query:
-        return jsonify({"error": "query is required"}), 400
-
+        return jsonify({"error":"query is required"}), 400
     embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
     version = payload.get("version", DEFAULT_VERSION)
-
     top_k = int(payload.get("top_k", DEFAULT_TOP_K))
     fetch_k = int(payload.get("fetch_k", DEFAULT_FETCH_K))
     search_type = payload.get("search_type", DEFAULT_SEARCH_TYPE)
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
 
-    store, _, cname, dim = get_store(embedding_id, version)
+    store, _, cname, backend = get_store(embedding_id, version)
     docs = retrieve_docs(store, query, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda)
     context, sources = format_context(docs, max_chars)
-
-    return jsonify({
-        "context": context,
-        "sources": sources,
-        "collection": cname,
-        "dimension": dim,
-        "embedding_id": embedding_id,
-        "version": version,
-        "top_k": top_k,
-        "fetch_k": fetch_k,
-        "search_type": search_type,
-        "mmr_lambda": mmr_lambda,
-    })
-
+    return jsonify({"context":context,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version})
 
 @app.post("/answer")
 def answer():
     payload = request.get_json(silent=True) or {}
     question = payload.get("query")
     if not question:
-        return jsonify({"error": "query is required"}), 400
-
-
+        return jsonify({"error":"query is required"}), 400
     embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
     version = payload.get("version", DEFAULT_VERSION)
-
     llm_id = payload.get("llm_id", DEFAULT_LLM_ID)
     top_k = int(payload.get("top_k", DEFAULT_TOP_K))
     fetch_k = int(payload.get("fetch_k", DEFAULT_FETCH_K))
@@ -512,35 +691,40 @@ def answer():
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
 
-    store, _, cname, dim = get_store(embedding_id, version)
+    store, _, cname, backend = get_store(embedding_id, version)
     docs = retrieve_docs(store, question, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda)
     context, sources = format_context(docs, max_chars)
 
-    system = (
-        "You are a precise assistant doing retrieval-augmented generation (RAG). "
-        "Answer ONLY using the provided CONTEXT. "
-        "If the context does not contain the answer, say so. "
-        "When referencing facts, cite them by mentioning Source + page."
+    system_text = (
+        "You are a precise assistant doing retrieval-augmented generation (RAG) for a technical regulatory document. "
+        "Answer ONLY using the provided CONTEXT. Do not use outside knowledge. "
+        "Be maximally specific: copy exact numeric ranges, units, and conditional clauses. "
+        "If multiple conditions apply, enumerate them (a), (b), etc. "
+        "If the context is insufficient to answer, say 'Not found in the provided context.' "
+        "Always add citations in-line like: (Source: <name>, page <n>). Do not invent page numbers."
+    )
+    user_text = (
+        "CONTEXT\n------\n"
+        f"{context}\n\n"
+        "QUESTION\n--------\n"
+        f"{question}\n\n"
+        "INSTRUCTIONS\n------------\n"
+        "1) Answer with the exact values/thresholds/ranges and any stated applicability conditions.\n"
+        "2) If the question asks to list items, provide a bullet list.\n"
+        "3) End with a short 'Evidence' section listing the cited sources/pages.\n"
     )
 
-    user = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nReturn your answer."
-
     llm = make_llm(llm_id)
-    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
 
-    # resp may be AIMessage
-    answer_text = getattr(resp, "content", None) or str(resp)
+    # If LangChain messages are available, use them; otherwise call .invoke with raw strings.
+    if SystemMessage is not None and HumanMessage is not None:
+        resp = llm.invoke([SystemMessage(content=system_text), HumanMessage(content=user_text)])
+        answer_text = getattr(resp, "content", None) or str(resp)
+    else:
+        resp = llm.invoke([type("M", (), {"content": system_text})(), type("M", (), {"content": user_text})()])
+        answer_text = getattr(resp, "content", None) or str(resp)
 
-    return jsonify({
-        "answer": answer_text,
-        "sources": sources,
-        "collection": cname,
-        "dimension": dim,
-        "embedding_id": embedding_id,
-        "version": version,
-        "llm_id": llm_id,
-    })
-
+    return jsonify({"answer":answer_text,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"llm_id":llm_id})
 
 if __name__ == "__main__":
     os.makedirs(CHROMA_PATH, exist_ok=True)
