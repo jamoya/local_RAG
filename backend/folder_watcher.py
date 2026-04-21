@@ -8,7 +8,7 @@ Folder watcher (no n8n) that:
   even if filesystem events were missed (uses API /sources + disk scan).
 
 Usage:
-  python folder_watcher_modelaware.py \
+  uv run python backend/folder_watcher.py \
     --watch "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder" \
     --api "http://127.0.0.1:5000" \
     --embedding-id "hf:BAAI/bge-large-en-v1.5" \

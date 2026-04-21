@@ -1,0 +1,55 @@
+{
+  "request": {
+    "url": "http://127.0.0.1:5000/answer",
+    "body": {
+      "query": "What products of the pulp and paper industry are sort listed to be included in an extension of the CBAM",
+      "llm_id": "gemini:gemini-2.5-flash"
+    }
+  },
+  "response": {
+    "answer": "The following products of the pulp and paper industry are shortlisted to be included in an extension of the CBAM:\n\n*   **Pulp (HS Chapter 47):**\n    *   Mechanical wood pulp, not chemically treated (HS 4701) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215; page 159, chunk 315)\n    *   Chemical wood pulp, dissolving grades (HS 4702) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215; page 159, chunk 315)\n    *   Chemical wood pulp, soda or sulphate (excl. dissolving grades) (HS 4703) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215; page 159, chunk 315)\n    *   Chemical wood pulp, sulphite (excl. dissolving grades) (HS 4704) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215; page 159, chunk 315)\n    *   Wood pulp obtained by a combination of mechanical and chemical pulping processes (HS 4705) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215; page 159, chunk 315)\n*   **Paper and paperboard (HS Chapter 48):**\n    *   Newsprint (HS 4801) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215)\n    *   Uncoated paper and paperboard, of a kind used for writing, printing or other graphic purposes (HS 4802), with the exception of handmade papers (HS 480210) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215)\n    *   Toilet or facial tissue stock, towel or (HS 4803) (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215)\n    *   All CN codes under HS Chapter 48 (paper and paperboard) are considered for extension, should the main precursor HS Chapter 47 (wood pulp) be included in the CBAM. (Source: CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 56, chunk 117)\n\n**Evidence:**\n*   CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 56, chunk 117\n*   CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 101, chunk 215\n*   CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf, page 159, chunk 315",
+    "backend": "chroma",
+    "collection": "my_local_knowledge_base__v1__hf_baai_bge_large_en_v1_5",
+    "embedding_id": "hf:BAAI/bge-large-en-v1.5",
+    "llm_id": "gemini:gemini-2.5-flash",
+    "sources": [
+      {
+        "chunk": 213,
+        "page": 100,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      },
+      {
+        "chunk": 214,
+        "page": 100,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      },
+      {
+        "chunk": 315,
+        "page": 159,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      },
+      {
+        "chunk": 117,
+        "page": 56,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      },
+      {
+        "chunk": 118,
+        "page": 56,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      },
+      {
+        "chunk": 215,
+        "page": 101,
+        "source": "CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf",
+        "source_path": "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder/CBAM horizontal extension Final Report _CLEAN_31.10.2025.pdf"
+      }
+    ],
+    "version": "v1"
+  }
+}
