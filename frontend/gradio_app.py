@@ -40,6 +40,9 @@ MODEL_CHOICES = [
     "openai:gpt-4o",
     "openai:gpt-4.1-mini",
     "gemini:gemini-2.5-flash",
+    "anthropic:claude-sonnet-4-6",
+    "anthropic:claude-haiku-4-5",
+    "anthropic:claude-opus-4-7",
     "ollama:llama3.2",
     "mock:any",
 ]
@@ -694,6 +697,49 @@ def chat_step(
     return history, status, request_pretty, raw_pretty
 
 
+def compare_step(
+    question: str,
+    api_base: str,
+    endpoint: str,
+    timeout_s: int,
+    launch_compatible: bool,
+    # Config A
+    llm_id_a: str, embedding_id_a: str, version_a: str,
+    top_k_a: int, fetch_k_a: int, search_type_a: str,
+    mmr_lambda_a: float, max_context_chars_a: int,
+    # Config B
+    llm_id_b: str, embedding_id_b: str, version_b: str,
+    top_k_b: int, fetch_k_b: int, search_type_b: str,
+    mmr_lambda_b: float, max_context_chars_b: int,
+) -> Tuple[str, str, str, str, str, str]:
+    """Run the same question against two configs in parallel.
+
+    Returns (answer_a, sources_a_json, raw_a_json, answer_b, sources_b_json, raw_b_json).
+    Parallelism keeps the perceived latency comparable when the user is judging
+    speed alongside answer quality.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(llm_id, embedding_id, version, top_k, fetch_k, search_type, mmr_lambda, max_context_chars):
+        return ask_api(
+            question=question,
+            api_base=api_base, endpoint=endpoint, llm_id=llm_id,
+            embedding_id=embedding_id, version=version,
+            top_k=top_k, fetch_k=fetch_k, search_type=search_type,
+            mmr_lambda=mmr_lambda, max_context_chars=max_context_chars,
+            timeout_s=timeout_s, launch_compatible=launch_compatible,
+            history=None,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa = ex.submit(_one, llm_id_a, embedding_id_a, version_a, top_k_a, fetch_k_a, search_type_a, mmr_lambda_a, max_context_chars_a)
+        fb = ex.submit(_one, llm_id_b, embedding_id_b, version_b, top_k_b, fetch_k_b, search_type_b, mmr_lambda_b, max_context_chars_b)
+        ans_a, src_a, raw_a, _, _ = fa.result()
+        ans_b, src_b, raw_b, _, _ = fb.result()
+
+    return ans_a, src_a, raw_a, ans_b, src_b, raw_b
+
+
 def make_download_file(filename: str, user_query: str, request_pretty: str, raw_pretty: str) -> str:
     """Write the last exchange to a Markdown file and return its path."""
     filename = (filename or "rag_exchange.md").strip()
@@ -883,6 +929,92 @@ def build_ui() -> gr.Blocks:
                             .then(fn=lambda: "", inputs=[], outputs=[chat_msg])
                         )
                         clear_chat_btn.click(fn=lambda: [], inputs=[], outputs=[chatbot])
+
+                    with gr.Tab("Compare"):
+                        with gr.Group(elem_classes=["nb-card"]):
+                            gr.HTML(
+                                '<div class="nb-section-title">Side-by-side comparison</div>'
+                                '<div class="nb-counts">Run the same question against two configs in parallel. '
+                                'Defaults A → main settings, B → a second LLM. Override any field.</div>'
+                            )
+                            cmp_question = gr.Textbox(
+                                label="Question",
+                                lines=3,
+                                placeholder="Same question goes to both columns…",
+                            )
+                            with gr.Row():
+                                compare_btn = gr.Button("Compare", variant="primary")
+                                clear_cmp_btn = gr.Button("Clear", variant="secondary")
+
+                        with gr.Row():
+                            # ---- Config A ----
+                            with gr.Column():
+                                with gr.Group(elem_classes=["nb-card"]):
+                                    gr.HTML('<div class="nb-section-title">Config A</div>')
+                                    llm_id_a = gr.Dropdown(
+                                        label="LLM", choices=MODEL_CHOICES,
+                                        value=DEFAULT_LLM_ID, allow_custom_value=True,
+                                    )
+                                    with gr.Row():
+                                        embedding_id_a = gr.Textbox(label="embedding_id", value=initial_embedding_id)
+                                        version_a = gr.Textbox(label="version", value=initial_version)
+                                    with gr.Row():
+                                        top_k_a = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                                        fetch_k_a = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
+                                    with gr.Row():
+                                        search_type_a = gr.Dropdown(
+                                            choices=["mmr", "similarity"], value="mmr", label="search_type",
+                                        )
+                                        mmr_lambda_a = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
+                                    max_context_chars_a = gr.Slider(
+                                        2000, 50000, value=18000, step=500, label="max_context_chars",
+                                    )
+                                    answer_a = gr.Markdown()
+                                    with gr.Accordion("Cited chunks (JSON)", open=False):
+                                        sources_a_json = gr.Code(language="json")
+                                    with gr.Accordion("Raw API response (JSON)", open=False):
+                                        raw_a_json = gr.Code(language="json")
+
+                            # ---- Config B ----
+                            with gr.Column():
+                                with gr.Group(elem_classes=["nb-card"]):
+                                    gr.HTML('<div class="nb-section-title">Config B</div>')
+                                    llm_id_b = gr.Dropdown(
+                                        label="LLM", choices=MODEL_CHOICES,
+                                        value="anthropic:claude-sonnet-4-6", allow_custom_value=True,
+                                    )
+                                    with gr.Row():
+                                        embedding_id_b = gr.Textbox(label="embedding_id", value=initial_embedding_id)
+                                        version_b = gr.Textbox(label="version", value=initial_version)
+                                    with gr.Row():
+                                        top_k_b = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                                        fetch_k_b = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
+                                    with gr.Row():
+                                        search_type_b = gr.Dropdown(
+                                            choices=["mmr", "similarity"], value="mmr", label="search_type",
+                                        )
+                                        mmr_lambda_b = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
+                                    max_context_chars_b = gr.Slider(
+                                        2000, 50000, value=18000, step=500, label="max_context_chars",
+                                    )
+                                    answer_b = gr.Markdown()
+                                    with gr.Accordion("Cited chunks (JSON)", open=False):
+                                        sources_b_json = gr.Code(language="json")
+                                    with gr.Accordion("Raw API response (JSON)", open=False):
+                                        raw_b_json = gr.Code(language="json")
+
+                        compare_btn.click(
+                            fn=compare_step,
+                            inputs=[
+                                cmp_question, api_base, endpoint, timeout_s, launch_compatible,
+                                llm_id_a, embedding_id_a, version_a,
+                                top_k_a, fetch_k_a, search_type_a, mmr_lambda_a, max_context_chars_a,
+                                llm_id_b, embedding_id_b, version_b,
+                                top_k_b, fetch_k_b, search_type_b, mmr_lambda_b, max_context_chars_b,
+                            ],
+                            outputs=[answer_a, sources_a_json, raw_a_json, answer_b, sources_b_json, raw_b_json],
+                        )
+                        clear_cmp_btn.click(fn=lambda: "", inputs=[], outputs=[cmp_question])
 
         # Wire up the Sources panel:
         # - refresh_btn: ingest any new files in watched_folder/ then re-list /sources.

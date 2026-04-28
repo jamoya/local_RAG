@@ -572,6 +572,53 @@ def test_chat_history_values_are_messages_format_dicts():
 
 
 # ----------------------------
+# compare_step
+# ----------------------------
+
+def test_compare_step_runs_both_configs_and_keeps_them_separate():
+    """Two parallel /answer calls go through with their own payloads; outputs are not crossed."""
+    def fake_post(url, payload, timeout_s):
+        if payload["llm_id"] == "openai:gpt-4o-mini":
+            return {"answer": "answer-A", "sources": [{"source": "a.pdf"}]}
+        if payload["llm_id"] == "anthropic:claude-sonnet-4-6":
+            return {"answer": "answer-B", "sources": [{"source": "b.pdf"}]}
+        raise AssertionError(f"unexpected llm_id {payload['llm_id']}")
+
+    with patch("gradio_app._post_json", side_effect=fake_post):
+        ans_a, src_a, raw_a, ans_b, src_b, raw_b = ga.compare_step(
+            question="same Q",
+            api_base="http://x", endpoint="answer", timeout_s=5, launch_compatible=True,
+            llm_id_a="openai:gpt-4o-mini", embedding_id_a="fake:any", version_a="v1",
+            top_k_a=4, fetch_k_a=12, search_type_a="mmr",
+            mmr_lambda_a=0.3, max_context_chars_a=18000,
+            llm_id_b="anthropic:claude-sonnet-4-6", embedding_id_b="fake:any", version_b="v1",
+            top_k_b=6, fetch_k_b=24, search_type_b="similarity",
+            mmr_lambda_b=0.2, max_context_chars_b=12000,
+        )
+
+    assert "answer-A" in ans_a
+    assert "answer-B" in ans_b
+    assert "a.pdf" in src_a and "b.pdf" not in src_a
+    assert "b.pdf" in src_b and "a.pdf" not in src_b
+    assert "answer-A" in raw_a and "answer-B" in raw_b
+
+
+def test_compare_step_blank_question_returns_two_errors():
+    ans_a, _, _, ans_b, _, _ = ga.compare_step(
+        question="   ",
+        api_base="http://x", endpoint="answer", timeout_s=5, launch_compatible=True,
+        llm_id_a="mock:any", embedding_id_a="", version_a="",
+        top_k_a=1, fetch_k_a=1, search_type_a="mmr",
+        mmr_lambda_a=0.3, max_context_chars_a=2000,
+        llm_id_b="mock:any", embedding_id_b="", version_b="",
+        top_k_b=1, fetch_k_b=1, search_type_b="mmr",
+        mmr_lambda_b=0.3, max_context_chars_b=2000,
+    )
+    assert "enter a question" in ans_a.lower()
+    assert "enter a question" in ans_b.lower()
+
+
+# ----------------------------
 # make_download_file
 # ----------------------------
 

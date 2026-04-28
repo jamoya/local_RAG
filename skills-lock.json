@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "evaluate-rag": {
+      "source": "hamelsmu/evals-skills",
+      "sourceType": "github",
+      "skillPath": "skills/evaluate-rag/SKILL.md",
+      "computedHash": "2ffd989e885c2eceeede12e4f3470926010bd07c87e36e7dd0c6af52c4597504"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",

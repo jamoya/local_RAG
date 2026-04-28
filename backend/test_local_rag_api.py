@@ -198,6 +198,45 @@ def test_ingest_folder_ingests_new_files(client, tmp_path):
     assert str((tmp_path / "b.md").resolve()) in srcs
 
 
+# ----------------------------
+# Anthropic provider + cache_control plumbing
+# ----------------------------
+
+def test_build_chat_messages_emits_cache_control_blocks(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841 - ensures module is loaded
+    import local_rag_api as mod
+
+    msgs = mod._build_chat_messages(
+        "system prompt",
+        history=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        user_text="QUESTION ...",
+        cacheable_user_prefix="CONTEXT block ...",
+    )
+    # System block is structured with cache_control
+    assert isinstance(msgs[0].content, list)
+    assert msgs[0].content[0]["cache_control"] == {"type": "ephemeral"}
+    assert msgs[0].content[0]["text"] == "system prompt"
+    # Final user message has two blocks: cached prefix + uncached question
+    final = msgs[-1].content
+    assert isinstance(final, list)
+    assert len(final) == 2
+    assert final[0]["text"] == "CONTEXT block ..."
+    assert final[0]["cache_control"] == {"type": "ephemeral"}
+    assert final[1]["text"] == "QUESTION ..."
+    assert "cache_control" not in final[1]
+
+
+def test_make_llm_anthropic_returns_chat_anthropic(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    if mod.ChatAnthropic is None:
+        pytest.skip("langchain-anthropic not installed in this env")
+    llm = mod.make_llm("anthropic:claude-sonnet-4-5")
+    assert llm.__class__.__name__ == "ChatAnthropic"
+    assert getattr(llm, "model", None) or getattr(llm, "model_name", None)
+
+
 def test_ingest_folder_skips_unchanged_on_second_call(client, tmp_path):
     (tmp_path / "x.txt").write_text("hello", encoding="utf-8")
 

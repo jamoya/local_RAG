@@ -85,6 +85,11 @@ except Exception:  # pragma: no cover
     ChatGoogleGenerativeAI = None  # type: ignore
 
 try:
+    from langchain_anthropic import ChatAnthropic  # type: ignore
+except Exception:  # pragma: no cover
+    ChatAnthropic = None  # type: ignore
+
+try:
     from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # type: ignore
 except Exception:  # pragma: no cover
     SystemMessage = None  # type: ignore
@@ -543,6 +548,14 @@ def make_llm(llm_id: str):
             raise RuntimeError("langchain-google-genai not installed.")
         return ChatGoogleGenerativeAI(model=model)
 
+    if provider == "anthropic":
+        if ChatAnthropic is None:
+            raise RuntimeError("langchain-anthropic not installed.")
+        return ChatAnthropic(
+            model=model,
+            max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "4096")),
+        )
+
     raise ValueError(f"Unsupported llm provider: {provider}")
 
 # ----------------------------
@@ -782,14 +795,33 @@ def retrieve():
 MAX_HISTORY_MESSAGES = 100  # 50 user/assistant exchanges
 
 
-def _build_chat_messages(system_text: str, history, user_text: str):
+def _build_chat_messages(
+    system_text: str,
+    history,
+    user_text: str,
+    *,
+    cacheable_user_prefix: Optional[str] = None,
+):
     """Build the message list passed to the LLM.
+
+    When `cacheable_user_prefix` is provided, the system prompt and that prefix
+    are emitted as structured content blocks tagged with Anthropic-style
+    cache_control. langchain-anthropic forwards these to the Messages API;
+    other providers ignore unknown fields. Use it for the retrieved context so
+    re-runs of the same query against multiple Claude configs hit the cache.
 
     Falls back to lightweight shim objects with a .content attribute when
     langchain_core is not installed (matches the pre-existing behavior).
     """
+    use_cache = cacheable_user_prefix is not None
     if SystemMessage is not None and HumanMessage is not None and AIMessage is not None:
-        msgs = [SystemMessage(content=system_text)]
+        if use_cache:
+            sys_content = [
+                {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
+            ]
+        else:
+            sys_content = system_text
+        msgs = [SystemMessage(content=sys_content)]
         for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
             if not isinstance(item, dict):
                 continue
@@ -801,7 +833,14 @@ def _build_chat_messages(system_text: str, history, user_text: str):
                 msgs.append(HumanMessage(content=content))
             elif role in {"assistant", "ai"}:
                 msgs.append(AIMessage(content=content))
-        msgs.append(HumanMessage(content=user_text))
+        if use_cache:
+            user_content = [
+                {"type": "text", "text": cacheable_user_prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": user_text},
+            ]
+        else:
+            user_content = user_text
+        msgs.append(HumanMessage(content=user_content))
         return msgs
 
     shim = lambda c: type("M", (), {"content": c})()
@@ -809,7 +848,8 @@ def _build_chat_messages(system_text: str, history, user_text: str):
     for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
         if isinstance(item, dict) and item.get("content"):
             msgs.append(shim(str(item["content"])))
-    msgs.append(shim(user_text))
+    combined = (cacheable_user_prefix + "\n\n" + user_text) if use_cache else user_text
+    msgs.append(shim(combined))
     return msgs
 
 
@@ -846,10 +886,12 @@ def answer():
         "clarifying the previous answer, pronoun/entity resolution), you MAY use the prior turns directly "
         "and no citations are needed. If multiple conditions apply to a factual answer, enumerate them (a), (b), etc."
     )
-    user_text = (
+    cacheable_prefix = (
         "CONTEXT\n------\n"
-        f"{context}\n\n"
-        "QUESTION\n--------\n"
+        f"{context}"
+    )
+    user_text = (
+        "\n\nQUESTION\n--------\n"
         f"{question}\n\n"
         "INSTRUCTIONS\n------------\n"
         "1) Answer with the exact values/thresholds/ranges and any stated applicability conditions.\n"
@@ -859,7 +901,12 @@ def answer():
 
     llm = make_llm(llm_id)
 
-    messages = _build_chat_messages(system_text, history, user_text)
+    if llm_id.startswith("anthropic:"):
+        messages = _build_chat_messages(
+            system_text, history, user_text, cacheable_user_prefix=cacheable_prefix
+        )
+    else:
+        messages = _build_chat_messages(system_text, history, cacheable_prefix + user_text)
     resp = llm.invoke(messages)
     answer_text = getattr(resp, "content", None) or str(resp)
 
