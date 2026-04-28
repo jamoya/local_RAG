@@ -68,6 +68,58 @@ def test_ingest_retrieve_answer_txt(client, tmp_path):
     ans = r.get_json()["answer"]
     assert "MOCK_ANSWER" in ans
 
+def test_answer_accepts_history_and_forwards_to_llm(client, tmp_path):
+    content = b"Smitheries covered by the BREF have hammers exceeding 50 kilojoule."
+    r = client.post(
+        "/ingest",
+        data={
+            "embedding_id": "fake:any", "version": "vtest",
+            "source_path": str(tmp_path / "doc.txt"),
+            "file": (io.BytesIO(content), "doc.txt"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 200, r.data
+
+    history = [
+        {"role": "user", "content": "my name is Jose"},
+        {"role": "assistant", "content": "Nice to meet you, Jose."},
+    ]
+    r = client.post("/answer", json={
+        "query": "what is my name?",
+        "embedding_id": "fake:any", "version": "vtest", "llm_id": "mock:any",
+        "history": history,
+    })
+    assert r.status_code == 200, r.data
+    ans = r.get_json()["answer"]
+    assert "MOCK_ANSWER" in ans
+    # Mock LLM echoes the last message content; history is passed between
+    # system + final user, so the final message is the RAG user turn.
+    assert "what is my name?" in ans
+
+
+def test_answer_ignores_malformed_history(client, tmp_path):
+    content = b"Some content to ingest."
+    r = client.post(
+        "/ingest",
+        data={
+            "embedding_id": "fake:any", "version": "vtest",
+            "source_path": str(tmp_path / "doc.txt"),
+            "file": (io.BytesIO(content), "doc.txt"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 200
+
+    # history is not a list -> ignored, not 500
+    r = client.post("/answer", json={
+        "query": "hi", "embedding_id": "fake:any", "version": "vtest",
+        "llm_id": "mock:any", "history": "not-a-list",
+    })
+    assert r.status_code == 200
+    assert "MOCK_ANSWER" in r.get_json()["answer"]
+
+
 def test_ingest_pdf_page_range(client, tmp_path):
     # Create a tiny PDF with 2 pages and ingest only page 2.
     from reportlab.pdfgen import canvas
@@ -95,3 +147,70 @@ def test_ingest_pdf_page_range(client, tmp_path):
     ctx = r.get_json()["context"]
     assert "AOX" in ctx
     assert "0.1" in ctx or "1 mg/l" in ctx
+
+
+# ----------------------------
+# /config
+# ----------------------------
+
+def test_config_returns_server_defaults(client):
+    r = client.get("/config")
+    assert r.status_code == 200
+    js = r.get_json()
+    assert js["embedding_id"] == "fake:any"
+    assert js["version"] == "vtest"
+    assert js["llm_id"] == "mock:any"
+    assert isinstance(js["watched_folder"], str)
+    assert set(js["supported_extensions"]) == {".pdf", ".txt", ".md", ".docx"}
+
+
+# ----------------------------
+# /ingest_folder
+# ----------------------------
+
+def test_ingest_folder_missing_folder_returns_400(client, tmp_path):
+    r = client.post("/ingest_folder", json={"folder": str(tmp_path / "does-not-exist")})
+    assert r.status_code == 400
+    assert "folder not found" in r.get_json()["error"].lower()
+
+
+def test_ingest_folder_ingests_new_files(client, tmp_path):
+    (tmp_path / "a.txt").write_text("alpha content one", encoding="utf-8")
+    (tmp_path / "b.md").write_text("beta markdown two", encoding="utf-8")
+    (tmp_path / "skip.bin").write_bytes(b"binary ignored")  # unsupported ext
+
+    r = client.post("/ingest_folder", json={
+        "folder": str(tmp_path),
+        "embedding_id": "fake:any",
+        "version": "vtest",
+    })
+    assert r.status_code == 200, r.data
+    js = r.get_json()
+    assert js["status"] == "ok"
+    assert js["scanned"] == 2  # .bin is not tracked
+    assert len(js["ingested"]) == 2
+    assert js["skipped_unchanged"] == 0
+    assert js["errors"] == []
+
+    r2 = client.get("/sources?embedding_id=fake:any&version=vtest")
+    srcs = set(r2.get_json()["sources"])
+    assert str((tmp_path / "a.txt").resolve()) in srcs
+    assert str((tmp_path / "b.md").resolve()) in srcs
+
+
+def test_ingest_folder_skips_unchanged_on_second_call(client, tmp_path):
+    (tmp_path / "x.txt").write_text("hello", encoding="utf-8")
+
+    r1 = client.post("/ingest_folder", json={
+        "folder": str(tmp_path), "embedding_id": "fake:any", "version": "vtest",
+    })
+    assert r1.status_code == 200
+    assert len(r1.get_json()["ingested"]) == 1
+
+    r2 = client.post("/ingest_folder", json={
+        "folder": str(tmp_path), "embedding_id": "fake:any", "version": "vtest",
+    })
+    assert r2.status_code == 200
+    js = r2.get_json()
+    assert js["ingested"] == []
+    assert js["skipped_unchanged"] == 1

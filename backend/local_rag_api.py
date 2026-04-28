@@ -20,6 +20,7 @@ import re
 import json
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
@@ -84,10 +85,11 @@ except Exception:  # pragma: no cover
     ChatGoogleGenerativeAI = None  # type: ignore
 
 try:
-    from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # type: ignore
 except Exception:  # pragma: no cover
     SystemMessage = None  # type: ignore
     HumanMessage = None  # type: ignore
+    AIMessage = None  # type: ignore
 
 # Embeddings (optional). For tests/offline we support "fake" and "tfidf".
 try:
@@ -134,6 +136,10 @@ DEFAULT_MMR_LAMBDA = float(os.environ.get("MMR_LAMBDA", "0.3"))
 DEFAULT_MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "18000"))
 
 SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}
+
+WATCHED_FOLDER = os.path.abspath(
+    os.environ.get("WATCHED_FOLDER", os.path.join(os.getcwd(), "watched_folder"))
+)
 
 app = Flask(__name__)
 
@@ -581,6 +587,62 @@ def delete():
     delete_by_source(store, source_path)
     return jsonify({"status":"ok","deleted_source_path":source_path,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version})
 
+def _ingest_documents(docs: List[Document], source_path: str, embedding_id: str, version: str) -> Dict[str, Any]:
+    """Chunk + upsert pre-loaded Documents. Shared by /ingest and /ingest_folder."""
+    store, _, cname, backend = get_store(embedding_id, version)
+    delete_by_source(store, source_path)
+
+    chunks = split_documents(docs)
+    for idx, d in enumerate(chunks):
+        md = dict(d.metadata or {})
+        md["chunk"] = idx
+        md["id"] = doc_id(source_path, md.get("page"), idx)
+        d.metadata = md
+
+    if hasattr(store, "add_documents"):
+        store.add_documents(chunks)
+    elif hasattr(store, "_collection"):
+        store.add_texts(
+            [c.page_content for c in chunks],
+            metadatas=[c.metadata for c in chunks],
+            ids=[c.metadata["id"] for c in chunks],
+        )
+    else:
+        raise RuntimeError("Store does not support add_documents")
+
+    return {
+        "collection": cname,
+        "backend": backend,
+        "embedding_id": embedding_id,
+        "version": version,
+        "pages_loaded": len(docs),
+        "chunks_added": len(chunks),
+        "total_chars": sum(len(d.page_content or "") for d in docs),
+    }
+
+
+def _ingest_local_file(source_path: str, embedding_id: str, version: str) -> Dict[str, Any]:
+    """Load a file already on disk and ingest it into the active store."""
+    p = Path(source_path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"file not found: {source_path}")
+    filename = p.name
+    ext = p.suffix.lower()
+    if ext not in SUPPORTED_EXTS:
+        raise ValueError(f"unsupported extension '{ext}'")
+
+    if ext == ".pdf":
+        docs = load_pdf_documents(str(p), filename, str(p))
+    elif ext == ".docx":
+        docs = load_docx(p.read_bytes(), filename, str(p))
+    else:
+        docs = load_text(p.read_bytes(), filename, str(p))
+
+    res = _ingest_documents(docs, str(p), embedding_id, version)
+    res.update({"source_path": str(p), "filename": filename})
+    return res
+
+
 @app.post("/ingest")
 def ingest():
     if "file" not in request.files:
@@ -599,10 +661,6 @@ def ingest():
     ext = os.path.splitext(filename)[1].lower()
     if ext not in SUPPORTED_EXTS:
         return jsonify({"error": f"unsupported extension '{ext}'", "supported": sorted(SUPPORTED_EXTS)}), 400
-
-    store, _, cname, backend = get_store(embedding_id, version)
-    # Upsert behavior
-    delete_by_source(store, source_path)
 
     docs: List[Document] = []
     if ext == ".pdf":
@@ -626,35 +684,79 @@ def ingest():
     else:
         docs = load_text(raw, filename, source_path)
 
-    chunks = split_documents(docs)
+    res = _ingest_documents(docs, source_path, embedding_id, version)
+    return jsonify({"status": "ok", "source_path": source_path, "filename": filename, **res})
 
-    # Add chunk index metadata + deterministic IDs
-    for idx, d in enumerate(chunks):
-        md = dict(d.metadata or {})
-        md["chunk"] = idx
-        md["id"] = doc_id(source_path, md.get("page"), idx)
-        d.metadata = md
 
-    # Write to store
-    if hasattr(store, "add_documents"):
-        store.add_documents(chunks)
-    elif hasattr(store, "_collection"):
-        # Shouldn't happen, but be safe
-        store.add_texts([c.page_content for c in chunks], metadatas=[c.metadata for c in chunks], ids=[c.metadata["id"] for c in chunks])
-    else:
-        raise RuntimeError("Store does not support add_documents")
+@app.get("/config")
+def config():
+    """Return the server's current defaults so clients can auto-align."""
+    return jsonify({
+        "embedding_id": DEFAULT_EMBEDDING_ID,
+        "version": DEFAULT_VERSION,
+        "llm_id": DEFAULT_LLM_ID,
+        "watched_folder": WATCHED_FOLDER,
+        "supported_extensions": sorted(SUPPORTED_EXTS),
+    })
 
+
+@app.post("/ingest_folder")
+def ingest_folder():
+    """Scan a folder and ingest new/changed files. Uses the folder_watcher fingerprint+state."""
+    from folder_watcher import (
+        scan_disk, state_file_path, load_state, save_state, file_fingerprint,
+    )
+
+    payload = request.get_json(silent=True) or {}
+    folder = payload.get("folder") or WATCHED_FOLDER
+    embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
+    version = payload.get("version", DEFAULT_VERSION)
+    extensions = payload.get("extensions") or sorted(SUPPORTED_EXTS)
+
+    folder_path = Path(folder).expanduser().resolve()
+    if not folder_path.is_dir():
+        return jsonify({"error": f"folder not found or not a directory: {folder}"}), 400
+
+    state_path = state_file_path(folder_path, version, embedding_id)
+    state = load_state(state_path)
+    files_state = state.setdefault("files", {})
+
+    disk = scan_disk(folder_path, extensions, recursive=False)
+
+    ingested: List[Dict[str, Any]] = []
+    skipped_unchanged = 0
+    errors: List[Dict[str, str]] = []
+
+    for path_str in sorted(disk):
+        p = Path(path_str)
+        try:
+            fp = file_fingerprint(p)
+        except FileNotFoundError:
+            continue
+        prev = files_state.get(path_str)
+        if prev and prev.get("mtime") == fp["mtime"] and prev.get("size") == fp["size"]:
+            skipped_unchanged += 1
+            continue
+        try:
+            r = _ingest_local_file(path_str, embedding_id, version)
+            ingested.append({"source_path": r["source_path"], "chunks": r["chunks_added"]})
+            files_state[path_str] = fp
+            save_state(state_path, state)
+        except Exception as e:
+            errors.append({"source_path": path_str, "error": f"{type(e).__name__}: {e}"})
+
+    _, _, cname, backend = get_store(embedding_id, version)
     return jsonify({
         "status": "ok",
-        "source_path": source_path,
-        "filename": filename,
-        "collection": cname,
-        "backend": backend,
+        "folder": str(folder_path),
         "embedding_id": embedding_id,
         "version": version,
-        "pages_loaded": len(docs),
-        "chunks_added": len(chunks),
-        "total_chars": sum(len(d.page_content or "") for d in docs),
+        "collection": cname,
+        "backend": backend,
+        "scanned": len(disk),
+        "ingested": ingested,
+        "skipped_unchanged": skipped_unchanged,
+        "errors": errors,
     })
 
 @app.post("/retrieve")
@@ -676,6 +778,41 @@ def retrieve():
     context, sources = format_context(docs, max_chars)
     return jsonify({"context":context,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version})
 
+
+MAX_HISTORY_MESSAGES = 100  # 50 user/assistant exchanges
+
+
+def _build_chat_messages(system_text: str, history, user_text: str):
+    """Build the message list passed to the LLM.
+
+    Falls back to lightweight shim objects with a .content attribute when
+    langchain_core is not installed (matches the pre-existing behavior).
+    """
+    if SystemMessage is not None and HumanMessage is not None and AIMessage is not None:
+        msgs = [SystemMessage(content=system_text)]
+        for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", ""))
+            if not content:
+                continue
+            if role in {"user", "human"}:
+                msgs.append(HumanMessage(content=content))
+            elif role in {"assistant", "ai"}:
+                msgs.append(AIMessage(content=content))
+        msgs.append(HumanMessage(content=user_text))
+        return msgs
+
+    shim = lambda c: type("M", (), {"content": c})()
+    msgs = [shim(system_text)]
+    for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
+        if isinstance(item, dict) and item.get("content"):
+            msgs.append(shim(str(item["content"])))
+    msgs.append(shim(user_text))
+    return msgs
+
+
 @app.post("/answer")
 def answer():
     payload = request.get_json(silent=True) or {}
@@ -691,17 +828,23 @@ def answer():
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
 
+    history = payload.get("history") or []
+    if not isinstance(history, list):
+        history = []
+
     store, _, cname, backend = get_store(embedding_id, version)
     docs = retrieve_docs(store, question, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda)
     context, sources = format_context(docs, max_chars)
 
     system_text = (
         "You are a precise assistant doing retrieval-augmented generation (RAG) for a technical regulatory document. "
-        "Answer ONLY using the provided CONTEXT. Do not use outside knowledge. "
-        "Be maximally specific: copy exact numeric ranges, units, and conditional clauses. "
-        "If multiple conditions apply, enumerate them (a), (b), etc. "
-        "If the context is insufficient to answer, say 'Not found in the provided context.' "
-        "Always add citations in-line like: (Source: <name>, page <n>). Do not invent page numbers."
+        "You have two sources of information: (1) the retrieved CONTEXT below, and (2) the prior conversation turns. "
+        "For any FACTUAL/TECHNICAL claim about the documents, use ONLY the CONTEXT: "
+        "copy exact numeric ranges, units, and conditional clauses; cite in-line like (Source: <name>, page <n>); "
+        "if the CONTEXT is insufficient, reply 'Not found in the provided context.' Do not invent page numbers. "
+        "For conversational or meta questions about the chat itself (the user's name, what they just said, "
+        "clarifying the previous answer, pronoun/entity resolution), you MAY use the prior turns directly "
+        "and no citations are needed. If multiple conditions apply to a factual answer, enumerate them (a), (b), etc."
     )
     user_text = (
         "CONTEXT\n------\n"
@@ -716,13 +859,9 @@ def answer():
 
     llm = make_llm(llm_id)
 
-    # If LangChain messages are available, use them; otherwise call .invoke with raw strings.
-    if SystemMessage is not None and HumanMessage is not None:
-        resp = llm.invoke([SystemMessage(content=system_text), HumanMessage(content=user_text)])
-        answer_text = getattr(resp, "content", None) or str(resp)
-    else:
-        resp = llm.invoke([type("M", (), {"content": system_text})(), type("M", (), {"content": user_text})()])
-        answer_text = getattr(resp, "content", None) or str(resp)
+    messages = _build_chat_messages(system_text, history, user_text)
+    resp = llm.invoke(messages)
+    answer_text = getattr(resp, "content", None) or str(resp)
 
     return jsonify({"answer":answer_text,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"llm_id":llm_id})
 

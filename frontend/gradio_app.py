@@ -1,29 +1,40 @@
 from __future__ import annotations
 
+"""Gradio frontend for the Local RAG Flask API.
+
+Layout is inspired by NotebookLM: a left "Sources" panel that lists every
+file already ingested in the active Chroma collection, and a right side that
+holds the Q&A / Chat experience. The connection settings live in a single
+collapsed accordion so the main view stays clean.
+"""
+
+import html
 import json
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import gradio as gr
 
 
 # ----------------------------
-# Defaults (aligned with your existing client/server)
+# Defaults
 # ----------------------------
 DEFAULT_API_BASE = os.environ.get("RAG_API", "http://127.0.0.1:5000")
 DEFAULT_ENDPOINT = os.environ.get("RAG_ENDPOINT", "answer")
-
-# local_rag_api.py defaults
 DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "tfidf:local")
 DEFAULT_VERSION = os.environ.get("CHROMA_COLLECTION_VERSION", "v1")
 DEFAULT_LLM_ID = os.environ.get("LLM_ID", "openai:gpt-4o-mini")
-
 DEFAULT_TIMEOUT_S = int(os.environ.get("RAG_TIMEOUT", "120"))
+# Folder ingest can take several minutes for many/large PDFs + real embeddings.
+# Use a much larger ceiling than /answer, configurable via env var.
+DEFAULT_INGEST_TIMEOUT_S = int(os.environ.get("RAG_INGEST_TIMEOUT", "1800"))
 
-# Models known to work well with this Flask app (provider:model).
-# Availability still depends on server-side API keys and installed providers.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_WATCHED_FOLDER = os.environ.get("WATCHED_FOLDER", str(_REPO_ROOT / "watched_folder"))
+
 MODEL_CHOICES = [
     "openai:gpt-4o-mini",
     "openai:gpt-4o",
@@ -33,244 +44,357 @@ MODEL_CHOICES = [
     "mock:any",
 ]
 
+# Chat memory: keep the last N exchanges (1 exchange = 1 user msg + 1 assistant msg).
+CHAT_HISTORY_EXCHANGES = 50
+CHAT_HISTORY_MAX_MSGS = CHAT_HISTORY_EXCHANGES * 2
+
+
 # ----------------------------
-# Pastel UI palette (requested)
+# CSS (NotebookLM-inspired light theme)
 # ----------------------------
-PASTEL_DARK_BLUE = "#1e2b4a"   # app background
-PASTEL_PANEL = "#27375c"      # cards/panels
-PASTEL_LIGHT_BLUE = "#2f4472"  # replaces default whites
-PASTEL_YELLOW = "#fff3b0"     # user-editable fields
-PASTEL_GREEN = "#b7f0c2"      # API output fields
-PASTEL_ORANGE = "#ffd3a6"     # dropdown background
-TEXT_ON_DARK = "#eaf0ff"
-BORDER = "#5b6b93"
+CUSTOM_CSS = """
+:root {
+  --nb-bg:        #ffffff;
+  --nb-surface:   #f8f9fa;
+  --nb-surface-2: #f1f3f4;
+  --nb-border:    #e8eaed;
+  --nb-text:      #202124;
+  --nb-muted:     #5f6368;
+  --nb-primary:   #1a73e8;
+  --nb-primary-2: #1967d2;
+  --nb-success:   #137333;
+  --nb-danger:    #c5221f;
+  --nb-warning:   #b06000;
+}
 
-CUSTOM_CSS = f"""
-/* Base */
-:root {{
-  --app-bg: {PASTEL_DARK_BLUE};
-  --panel-bg: {PASTEL_PANEL};
-  --light-bg: {PASTEL_LIGHT_BLUE};
-  --text: {TEXT_ON_DARK};
-  --border: {BORDER};
-  --input-bg: {PASTEL_YELLOW};
-  --output-bg: {PASTEL_GREEN};
-  --dropdown-bg: {PASTEL_ORANGE};
-}}
-
-body, .gradio-container {{
-  background: var(--app-bg) !important;
-  color: var(--text) !important;
-}}
-
-/* Kill remaining default whites */
-.gradio-container, .gradio-container * {{
-  --color-background: var(--app-bg);
-}}
-.gradio-container .wrap,
-.gradio-container .block,
-.gradio-container .container,
-.gradio-container .gr-box,
-.gradio-container .gr-form,
-.gradio-container .gr-panel,
-.gradio-container .gr-accordion,
-.gradio-container .gr-accordion .label-wrap,
-.gradio-container .gr-accordion .wrap,
-.gradio-container .gr-accordion .content,
-.gradio-container .gr-tabitem,
-.gradio-container .gr-tab-nav,
-.gradio-container .gr-tab-nav button,
-.gradio-container .gr-tab-nav .tabitem,
-.gradio-container .gr-markdown,
-.gradio-container .gr-html,
-.gradio-container footer {{
-  background: var(--light-bg) !important;
-  color: var(--text) !important;
-}}
+body, .gradio-container {
+  background: var(--nb-bg) !important;
+  color: var(--nb-text) !important;
+  font-family: "Google Sans", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
 
 .gradio-container .prose, .gradio-container label, .gradio-container span,
-.gradio-container h1, .gradio-container h2, .gradio-container h3, .gradio-container p, .gradio-container li {{
-  color: var(--text) !important;
-}}
+.gradio-container h1, .gradio-container h2, .gradio-container h3,
+.gradio-container p, .gradio-container li {
+  color: var(--nb-text) !important;
+}
 
-/* Ensure readable text on light pastel blocks */
-.user-input, .user-input * {{
-  color: #0b1220 !important;
-}}
-.user-dropdown, .user-dropdown * {{
-  color: #0b1220 !important;
-}}
-.api-output, .api-output * {{
-  color: #0b1220 !important;
-}}
+.nb-header {
+  padding: 18px 24px 14px 24px;
+  border-bottom: 1px solid var(--nb-border);
+  background: var(--nb-bg);
+}
+.nb-header h1 {
+  margin: 0;
+  font-weight: 500;
+  font-size: 22px;
+  letter-spacing: -0.2px;
+}
+.nb-header .nb-sub {
+  margin-top: 2px;
+  color: var(--nb-muted);
+  font-size: 13px;
+}
 
-#app_title {{
-  background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 18px;
-  padding: 18px 18px 10px 18px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-}}
+.nb-card {
+  background: var(--nb-bg) !important;
+  border: 1px solid var(--nb-border) !important;
+  border-radius: 12px !important;
+  padding: 16px !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
 
-.panel {{
-  background: var(--panel-bg) !important;
-  border: 1px solid rgba(255,255,255,0.10) !important;
-  border-radius: 18px !important;
+.nb-side {
+  background: var(--nb-surface) !important;
+  border: 1px solid var(--nb-border) !important;
+  border-radius: 12px !important;
   padding: 14px !important;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.22);
-}}
+}
 
-hr {{
-  border-color: rgba(255,255,255,0.12);
-}}
+.nb-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--nb-muted);
+  margin: 0 0 10px 0;
+}
 
-/* User-editable fields (pastel yellow) */
-.user-input textarea,
-.user-input input,
-.user-input .wrap > textarea,
-.user-input .wrap > input,
-.user-input .gr-text-input,
-.user-input .gr-number,
-.user-input .gr-slider input[type="range"] {{
-  background: var(--input-bg) !important;
-  color: #0b1220 !important;
-  border: 1px solid rgba(0,0,0,0.18) !important;
-}}
-
-.user-input input::placeholder,
-.user-input textarea::placeholder {{
-  color: rgba(11, 18, 32, 0.55) !important;
-}}
-
-/* Dropdown (pastel orange) */
-.user-dropdown select,
-.user-dropdown .wrap select,
-.user-dropdown .gr-dropdown select {{
-  background: var(--dropdown-bg) !important;
-  color: #0b1220 !important;
-  border: 1px solid rgba(0,0,0,0.18) !important;
-}}
-
-/* API output fields (pastel green) */
-.api-output textarea,
-.api-output input,
-.api-output pre,
-.api-output code,
-.api-output .cm-editor,
-.api-output .gr-code,
-.api-output .prose {{
-  background: var(--output-bg) !important;
-  color: #0b1220 !important;
-  border-radius: 14px !important;
-  border: 1px solid rgba(0,0,0,0.16) !important;
-}}
-
-#answer_box {{
-  background: var(--output-bg) !important;
-  color: #0b1220 !important;
-  border-radius: 14px;
-  padding: 12px 14px;
-  border: 1px solid rgba(0,0,0,0.16);
-}}
-
-/* Chat bubbles: keep contrast, avoid white */
-.gradio-container .message {{
-  border-radius: 14px !important;
-}}
-.gradio-container .message.user {{
-  background: var(--input-bg) !important;
-  color: #0b1220 !important;
-}}
-.gradio-container .message.bot {{
-  background: var(--output-bg) !important;
-  color: #0b1220 !important;
-}}
-
-/* Buttons */
-button {{
-  border-radius: 14px !important;
-}}
-button.primary {{
-  box-shadow: 0 10px 22px rgba(0,0,0,0.20);
-}}
-
-/* Tabs */
-.tabitem {{
-  border-radius: 14px !important;
-}}
-
-/* Status icons */
-#status_bar {{
+/* Sources list */
+.nb-sources-wrap {
+  max-height: 70vh;
+  overflow-y: scroll;
+  padding-right: 8px;
+  scrollbar-gutter: stable;
+}
+.nb-sources-wrap::-webkit-scrollbar { width: 10px; }
+.nb-sources-wrap::-webkit-scrollbar-thumb {
+  background: #c8ccd1;
+  border-radius: 8px;
+}
+.nb-sources-wrap::-webkit-scrollbar-thumb:hover { background: #aab0b7; }
+.nb-sources-wrap::-webkit-scrollbar-track {
+  background: var(--nb-surface-2);
+  border-radius: 8px;
+}
+.nb-source {
   display: flex;
+  align-items: flex-start;
   gap: 10px;
-  align-items: center;
-  margin-top: 8px;
-}}
-
-.status_icon {{
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--nb-border);
+  border-radius: 10px;
+  background: var(--nb-bg);
+  transition: background 0.15s ease;
+}
+.nb-source:hover { background: var(--nb-surface-2); }
+.nb-source-icon {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: var(--nb-surface-2);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 44px;
-  height: 44px;
-  border-radius: 14px;
-  border: 1px solid rgba(255,255,255,0.12);
-  background: rgba(255,255,255,0.08);
-  box-shadow: 0 10px 24px rgba(0,0,0,0.25);
-  font-size: 24px;
-}}
+  font-size: 13px;
+  color: var(--nb-muted);
+  font-weight: 600;
+}
+.nb-source-body { flex: 1 1 auto; min-width: 0; }
+.nb-source-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--nb-text);
+  word-break: break-word;
+}
+.nb-source-path {
+  font-size: 11px;
+  color: var(--nb-muted);
+  margin-top: 2px;
+  word-break: break-all;
+}
+.nb-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 10px;
+}
+.nb-status-ok { background: var(--nb-success); }
+.nb-status-missing { background: var(--nb-danger); }
 
-.spin {{
-  animation: spin 0.9s linear infinite;
-}}
-@keyframes spin {{
-  from {{ transform: rotate(0deg); }}
-  to {{ transform: rotate(360deg); }}
-}}
+.nb-empty {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--nb-muted);
+  font-size: 13px;
+  border: 1px dashed var(--nb-border);
+  border-radius: 10px;
+  background: var(--nb-bg);
+}
 
-.boom {{
-  animation: pop 0.35s ease-in-out infinite alternate;
-}}
-@keyframes pop {{
-  from {{ transform: scale(1.00); }}
-  to {{ transform: scale(1.12); }}
-}}
+.nb-counts {
+  font-size: 12px;
+  color: var(--nb-muted);
+  margin: 8px 0 12px 0;
+}
 
-/* Mouse-follow overlays (thumb + bomb) */
-.mouse_overlay {{
-  position: fixed;
-  left: 0px;
-  top: 0px;
-  z-index: 999999;
-  pointer-events: none;
-  display: none;
-}}
+/* Inputs */
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select {
+  border-radius: 8px !important;
+  border: 1px solid var(--nb-border) !important;
+  background: var(--nb-bg) !important;
+  color: var(--nb-text) !important;
+}
+.gradio-container input:focus,
+.gradio-container textarea:focus,
+.gradio-container select:focus {
+  outline: none !important;
+  border-color: var(--nb-primary) !important;
+  box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.15) !important;
+}
 
-/* Mouse-follow (always visible when component itself is visible) */
-.mouse_follow {{
-  position: fixed;
-  left: 0px;
-  top: 0px;
-  z-index: 999999;
-  pointer-events: none;
-}}
+/* Buttons */
+button.primary, button.lg.primary, .gradio-container button.primary {
+  background: var(--nb-primary) !important;
+  color: #ffffff !important;
+  border: 1px solid var(--nb-primary) !important;
+  border-radius: 999px !important;
+  padding: 8px 18px !important;
+  font-weight: 500 !important;
+}
+button.primary:hover, .gradio-container button.primary:hover {
+  background: var(--nb-primary-2) !important;
+  border-color: var(--nb-primary-2) !important;
+}
+.gradio-container button.secondary {
+  background: var(--nb-bg) !important;
+  color: var(--nb-text) !important;
+  border: 1px solid var(--nb-border) !important;
+  border-radius: 999px !important;
+  padding: 6px 14px !important;
+}
 
-/* Strong contrast rules on light pastel blocks */
-.api-output, .api-output * {{
-  color: #0b1220 !important;
-}}
+/* Chat bubbles */
+.gradio-container .message {
+  border-radius: 12px !important;
+  border: 1px solid var(--nb-border) !important;
+}
+.gradio-container .message.user {
+  background: var(--nb-surface-2) !important;
+  color: var(--nb-text) !important;
+}
+.gradio-container .message.bot {
+  background: var(--nb-bg) !important;
+  color: var(--nb-text) !important;
+}
+
+/* Tabs */
+.gradio-container .tab-nav button {
+  border-radius: 8px 8px 0 0 !important;
+  font-weight: 500 !important;
+}
+
+/* Status pill */
+.nb-status-pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--nb-border);
+  background: var(--nb-surface);
+  color: var(--nb-muted);
+}
+.nb-status-pill.ok { background: #e6f4ea; color: var(--nb-success); border-color: #b7dfc1; }
+.nb-status-pill.warn { background: #fef7e0; color: var(--nb-warning); border-color: #fde293; }
+.nb-status-pill.err { background: #fce8e6; color: var(--nb-danger); border-color: #f4c7c3; }
 """
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout_s: int) -> Dict[str, Any]:
-    """POST JSON and return parsed JSON response."""
-    resp = requests.post(url, json=payload, timeout=timeout_s)
-    resp.raise_for_status()
-    return resp.json()
+# ----------------------------
+# Pure helpers (unit-tested)
+# ----------------------------
+
+def extract_filename(source_path: str) -> str:
+    """Return just the filename portion of a path (cross-platform)."""
+    if not source_path:
+        return ""
+    return os.path.basename(source_path.replace("\\", "/"))
+
+
+def build_request_body(
+    question: str,
+    llm_id: str,
+    embedding_id: str,
+    version: str,
+    top_k: int,
+    fetch_k: int,
+    search_type: str,
+    mmr_lambda: float,
+    max_context_chars: int,
+    launch_compatible: bool,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Construct the JSON body sent to /answer.
+
+    When launch_compatible is True, only `query`, `llm_id`, and (if non-empty)
+    `history` are sent. Otherwise all retrieval knobs go too, minus blank values.
+    """
+    trimmed_history = (history or [])[-CHAT_HISTORY_MAX_MSGS:]
+
+    if launch_compatible:
+        body: Dict[str, Any] = {"query": question, "llm_id": (llm_id or "").strip()}
+        if trimmed_history:
+            body["history"] = trimmed_history
+        return body
+
+    body = {
+        "query": question,
+        "llm_id": (llm_id or "").strip(),
+        "embedding_id": (embedding_id or "").strip(),
+        "version": (version or "").strip(),
+        "top_k": int(top_k),
+        "fetch_k": int(fetch_k),
+        "search_type": (search_type or "").strip(),
+        "mmr_lambda": float(mmr_lambda),
+        "max_context_chars": int(max_context_chars),
+    }
+    if trimmed_history:
+        body["history"] = trimmed_history
+    return {k: v for k, v in body.items() if v not in ("", None, [])}
+
+
+def parse_sources_response(payload: Any) -> List[str]:
+    """Extract the list of source paths from a /sources response.
+
+    Tolerates both the documented shape (`{"sources": [...]}`) and the
+    folder_watcher's expected shape (`{"source_paths": [...]}`).
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("sources")
+    if raw is None:
+        raw = payload.get("source_paths")
+    if not isinstance(raw, list):
+        return []
+    return [s for s in raw if isinstance(s, str) and s]
+
+
+def annotate_sources(paths: List[str]) -> List[Dict[str, Any]]:
+    """Decorate raw source paths with name + on-disk existence."""
+    out: List[Dict[str, Any]] = []
+    for p in sorted(set(paths)):
+        out.append({
+            "path": p,
+            "name": extract_filename(p) or p,
+            "exists": Path(p).is_file(),
+        })
+    return out
+
+
+def render_sources_html(sources: List[Dict[str, Any]], collection: Optional[str] = None) -> str:
+    """Build the HTML shown inside the Sources panel."""
+    if not sources:
+        return (
+            '<div class="nb-empty">No documents ingested yet.<br>'
+            'Drop files into <code>watched_folder/</code> or POST to '
+            '<code>/ingest</code>.</div>'
+        )
+    total = len(sources)
+    on_disk = sum(1 for s in sources if s.get("exists"))
+    missing = total - on_disk
+    bits: List[str] = []
+    counts = f'{total} document{"s" if total != 1 else ""} · {on_disk} on disk'
+    if missing:
+        counts += f' · <span style="color:var(--nb-danger)">{missing} missing</span>'
+    if collection:
+        counts += f' · <span style="color:var(--nb-muted)">collection: {html.escape(collection)}</span>'
+    bits.append(f'<div class="nb-counts">{counts}</div>')
+    bits.append('<div class="nb-sources-wrap">')
+    for s in sources:
+        ext = (os.path.splitext(s["name"])[1] or "•").lstrip(".").upper()[:4] or "FILE"
+        dot = "nb-status-ok" if s["exists"] else "nb-status-missing"
+        title = "File present on disk" if s["exists"] else "File missing on disk"
+        bits.append(
+            '<div class="nb-source">'
+            f'  <div class="nb-source-icon">{html.escape(ext)}</div>'
+            '  <div class="nb-source-body">'
+            f'    <div class="nb-source-name">{html.escape(s["name"])}</div>'
+            '  </div>'
+            f'  <div class="nb-status-dot {dot}" title="{title}"></div>'
+            '</div>'
+        )
+    bits.append('</div>')
+    return "\n".join(bits)
 
 
 def _extract_answer(payload: Any) -> str:
-    """Try to extract a nice answer string from typical RAG API response shapes."""
+    """Best-effort extraction of an answer string from a RAG API response."""
     if isinstance(payload, dict):
         for k in ("answer", "result", "text", "message", "content"):
             v = payload.get(k)
@@ -279,22 +403,152 @@ def _extract_answer(payload: Any) -> str:
         if "data" in payload:
             return _extract_answer(payload["data"])
         return json.dumps(payload, indent=2, ensure_ascii=False)
-
     if isinstance(payload, list):
         if not payload:
             return "<empty list response>"
-        first = payload[0]
-        if isinstance(first, dict):
-            for k in ("answer", "context", "result", "text", "message"):
-                v = first.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v
-            return json.dumps(first, indent=2, ensure_ascii=False)
-        if isinstance(first, str):
-            return first
-        return json.dumps(first, indent=2, ensure_ascii=False)
-
+        return _extract_answer(payload[0])
     return str(payload)
+
+
+# ----------------------------
+# IO helpers (call the API)
+# ----------------------------
+
+def _post_json(url: str, payload: Dict[str, Any], timeout_s: int) -> Dict[str, Any]:
+    resp = requests.post(url, json=payload, timeout=timeout_s)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_sources(
+    api_base: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int = 30,
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
+    """Call GET /sources and return (annotated_sources, collection, error)."""
+    api_base = (api_base or "").strip().rstrip("/")
+    if not api_base:
+        return [], None, "API base URL is empty."
+    try:
+        params = {
+            "embedding_id": (embedding_id or "").strip(),
+            "version": (version or "").strip(),
+        }
+        params = {k: v for k, v in params.items() if v}
+        r = requests.get(f"{api_base}/sources", params=params, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return [], None, f"{type(e).__name__}: {e}"
+    paths = parse_sources_response(data)
+    return annotate_sources(paths), (data.get("collection") if isinstance(data, dict) else None), None
+
+
+def refresh_sources_panel(
+    api_base: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int,
+) -> Tuple[str, str]:
+    """Returns (panel_html, status_pill_html)."""
+    sources, collection, err = fetch_sources(api_base, embedding_id, version, timeout_s)
+    if err is not None:
+        return (
+            f'<div class="nb-empty">Could not reach API: {html.escape(err)}</div>',
+            '<span class="nb-status-pill err">offline</span>',
+        )
+    pill = '<span class="nb-status-pill ok">connected</span>'
+    if any(not s["exists"] for s in sources):
+        pill = '<span class="nb-status-pill warn">missing files on disk</span>'
+    return render_sources_html(sources, collection=collection), pill
+
+
+def fetch_server_config(api_base: str, timeout_s: int = 2) -> Dict[str, Any]:
+    """Probe GET /config so the UI can align with the running backend.
+
+    Returns {} on any failure so the caller falls back to env/hardcoded defaults.
+    """
+    api_base = (api_base or "").strip().rstrip("/")
+    if not api_base:
+        return {}
+    try:
+        r = requests.get(f"{api_base}/config", timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def trigger_folder_ingest(
+    api_base: str,
+    folder: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call POST /ingest_folder. Returns (summary_dict, error_str)."""
+    api_base = (api_base or "").strip().rstrip("/")
+    if not api_base:
+        return None, "API base URL is empty."
+    body = {
+        "folder": (folder or "").strip(),
+        "embedding_id": (embedding_id or "").strip(),
+        "version": (version or "").strip(),
+    }
+    body = {k: v for k, v in body.items() if v}
+    try:
+        r = requests.post(f"{api_base}/ingest_folder", json=body, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    return data if isinstance(data, dict) else {}, None
+
+
+def _format_ingest_banner(summary: Optional[Dict[str, Any]], err: Optional[str]) -> str:
+    if err:
+        return f'<div class="nb-counts" style="color:var(--nb-danger)">Ingest failed: {html.escape(err)}</div>'
+    if not summary:
+        return ""
+    ingested = summary.get("ingested") or []
+    skipped = int(summary.get("skipped_unchanged") or 0)
+    errors = summary.get("errors") or []
+    total_chunks = sum(int(item.get("chunks") or 0) for item in ingested)
+    plural = "s" if len(ingested) != 1 else ""
+    base = html.escape(
+        f"Ingested {len(ingested)} new file{plural} · {total_chunks} chunks · {skipped} unchanged skipped"
+    )
+    if errors:
+        base += f' · <span style="color:var(--nb-danger)">{len(errors)} error(s)</span>'
+    return f'<div class="nb-counts">{base}</div>'
+
+
+def refresh_panel_with_ingest(
+    api_base: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int,
+    ingest_timeout_s: Optional[int] = None,
+) -> Tuple[str, str]:
+    """Trigger a folder ingest (watched_folder) then re-list /sources.
+
+    ``timeout_s`` is used for the short /sources call. ``ingest_timeout_s``
+    governs /ingest_folder, which may take minutes on large PDFs with real
+    embedding models; it defaults to DEFAULT_INGEST_TIMEOUT_S.
+    """
+    ingest_to = int(ingest_timeout_s) if ingest_timeout_s else DEFAULT_INGEST_TIMEOUT_S
+    summary, err = trigger_folder_ingest(
+        api_base=api_base,
+        folder=DEFAULT_WATCHED_FOLDER,
+        embedding_id=embedding_id,
+        version=version,
+        timeout_s=ingest_to,
+    )
+    panel_html, pill = refresh_sources_panel(api_base, embedding_id, version, timeout_s)
+    banner = _format_ingest_banner(summary, err)
+    return (banner + panel_html) if banner else panel_html, pill
 
 
 def ask_api(
@@ -311,15 +565,9 @@ def ask_api(
     max_context_chars: int,
     timeout_s: int,
     launch_compatible: bool,
-) -> Tuple[str, str, str, str]:
-    """
-    Returns:
-      - answer_text (markdown)
-      - sources_pretty (json)
-      - raw_pretty (json)
-      - status ("ok" | "error")
-      - request_pretty (json)
-    """
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str, str, str, str]:
+    """Returns (answer_md, sources_pretty_json, raw_pretty_json, status, request_pretty_json)."""
     question = (question or "").strip()
     if not question:
         return "Please enter a question.", "[]", "{}", "error", "{}"
@@ -330,25 +578,21 @@ def ask_api(
         return "API base URL is empty.", "[]", "{}", "error", "{}"
     if not endpoint:
         return "Endpoint is empty.", "[]", "{}", "error", "{}"
-
     url = f"{api_base}/{endpoint}"
 
-    if launch_compatible:
-        body: Dict[str, Any] = {"query": question, "llm_id": (llm_id or "").strip()}
-    else:
-        body = {
-            "query": question,
-            "llm_id": (llm_id or "").strip(),
-            "embedding_id": (embedding_id or "").strip(),
-            "version": (version or "").strip(),
-            "top_k": int(top_k),
-            "fetch_k": int(fetch_k),
-            "search_type": (search_type or "").strip(),
-            "mmr_lambda": float(mmr_lambda),
-            "max_context_chars": int(max_context_chars),
-        }
-        body = {k: v for k, v in body.items() if v not in ("", None)}
-
+    body = build_request_body(
+        question=question,
+        llm_id=llm_id,
+        embedding_id=embedding_id,
+        version=version,
+        top_k=top_k,
+        fetch_k=fetch_k,
+        search_type=search_type,
+        mmr_lambda=mmr_lambda,
+        max_context_chars=max_context_chars,
+        launch_compatible=launch_compatible,
+        history=history,
+    )
     request_pretty = json.dumps({"url": url, "body": body}, indent=2, ensure_ascii=False)
 
     t0 = time.time()
@@ -357,27 +601,66 @@ def ask_api(
         dt = time.time() - t0
     except requests.HTTPError as e:
         resp_text = ""
-        try:
-            resp_text = e.response.text if e.response is not None else ""
-        except Exception:
-            pass
+        if e.response is not None:
+            try:
+                resp_text = e.response.text
+            except Exception:
+                pass
         msg = f"HTTP error: {e}\n\nServer response:\n{resp_text}" if resp_text else f"HTTP error: {e}"
-        return f"```text\n{msg}\n```", "[]", "{}", "error", request_pretty if "request_pretty" in locals() else "{}"
+        return f"```text\n{msg}\n```", "[]", "{}", "error", request_pretty
     except Exception as e:
-        return f"```text\nRequest failed: {e}\n```", "[]", "{}", "error", request_pretty if "request_pretty" in locals() else "{}"
+        return f"```text\nRequest failed: {e}\n```", "[]", "{}", "error", request_pretty
 
     answer_text = _extract_answer(data)
-    sources = data.get("sources", [])
-    sources_pretty = json.dumps(sources, indent=2, ensure_ascii=False) if sources is not None else "[]"
+    sources = data.get("sources", []) if isinstance(data, dict) else []
+    sources_pretty = json.dumps(sources, indent=2, ensure_ascii=False)
     raw_pretty = json.dumps(data, indent=2, ensure_ascii=False)
-
-    header = f"**Endpoint:** `{url}`  \n**Latency:** `{dt:.2f}s`"
+    header = f"**Endpoint:** `{url}`  ·  **Latency:** `{dt:.2f}s`"
     return f"{header}\n\n{answer_text}", sources_pretty, raw_pretty, "ok", request_pretty
+
+
+def _flatten_content(content: Any) -> str:
+    """Coerce a Chatbot message's ``content`` field into a plain string.
+
+    Gradio 6.x returns rich-content as ``[{"text": ..., "type": "text"}, ...]``
+    when the Chatbot is passed back in as an input. Recurse through that
+    shape so the string we forward to the API is actually human text.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        if "text" in content:
+            return _flatten_content(content["text"])
+        if "value" in content:
+            return _flatten_content(content["value"])
+        return ""
+    if isinstance(content, (list, tuple)):
+        parts = [_flatten_content(p) for p in content]
+        return "".join(p for p in parts if p)
+    return str(content)
+
+
+def _normalize_chat_history(history: Any) -> List[Dict[str, str]]:
+    """Normalize mixed/legacy chatbot history into Gradio messages format."""
+    out: List[Dict[str, str]] = []
+    for item in (history or []):
+        if isinstance(item, dict):
+            role = str(item.get("role", "")).strip().lower()
+            content = _flatten_content(item.get("content"))
+            if role in {"user", "assistant"}:
+                out.append({"role": role, "content": content})
+            continue
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append({"role": "user", "content": _flatten_content(item[0])})
+            out.append({"role": "assistant", "content": _flatten_content(item[1])})
+    return out
 
 
 def chat_step(
     message: str,
-    history: List[Tuple[str, str]],
+    history: List[Dict[str, str]],
     api_base: str,
     endpoint: str,
     llm_id: str,
@@ -390,397 +673,229 @@ def chat_step(
     max_context_chars: int,
     timeout_s: int,
     launch_compatible: bool,
-) -> Tuple[List[Tuple[str, str]], str, str, str]:
-    """Append one turn to the chat."""
+) -> Tuple[List[Dict[str, str]], str, str, str]:
     message = (message or "").strip()
+    history = _normalize_chat_history(history)
     if not message:
         return history, "error", "{}", "{}"
-
     answer_md, _, raw_pretty, status, request_pretty = ask_api(
         question=message,
-        api_base=api_base,
-        endpoint=endpoint,
-        llm_id=llm_id,
-        embedding_id=embedding_id,
-        version=version,
-        top_k=top_k,
-        fetch_k=fetch_k,
-        search_type=search_type,
-        mmr_lambda=mmr_lambda,
-        max_context_chars=max_context_chars,
-        timeout_s=timeout_s,
-        launch_compatible=launch_compatible,
+        api_base=api_base, endpoint=endpoint, llm_id=llm_id,
+        embedding_id=embedding_id, version=version,
+        top_k=top_k, fetch_k=fetch_k, search_type=search_type,
+        mmr_lambda=mmr_lambda, max_context_chars=max_context_chars,
+        timeout_s=timeout_s, launch_compatible=launch_compatible,
+        history=history,
     )
-    history = list(history or [])
-    history.append((message, answer_md))
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": answer_md})
+    if len(history) > CHAT_HISTORY_MAX_MSGS:
+        history = history[-CHAT_HISTORY_MAX_MSGS:]
     return history, status, request_pretty, raw_pretty
 
 
-
 def make_download_file(filename: str, user_query: str, request_pretty: str, raw_pretty: str) -> str:
-    """Create a downloadable Markdown file with the last query and API response."""
-    filename = (filename or "").strip()
-    if not filename:
-        filename = "rag_exchange.md"
-
+    """Write the last exchange to a Markdown file and return its path."""
+    filename = (filename or "rag_exchange.md").strip()
     filename = os.path.basename(filename)
     if not filename.lower().endswith((".md", ".markdown")):
         filename = os.path.splitext(filename)[0] + ".md"
-
-    q = (user_query or "").strip()
-    req_txt = request_pretty or "{}"
-    resp_txt = raw_pretty or "{}"
-
     out_path = os.path.join(os.getcwd(), filename)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("# RAG exchange\n\n")
-        f.write("## User query\n\n")
-        f.write("```text\n" + (q or "<empty>") + "\n```\n\n")
-        f.write("## Request sent to Flask API\n\n")
-        f.write("```json\n" + req_txt + "\n```\n\n")
-        f.write("## Response from Flask API\n\n")
-        f.write("```json\n" + resp_txt + "\n```\n")
-
+        f.write("## User query\n\n```text\n" + ((user_query or "").strip() or "<empty>") + "\n```\n\n")
+        f.write("## Request sent to Flask API\n\n```json\n" + (request_pretty or "{}") + "\n```\n\n")
+        f.write("## Response from Flask API\n\n```json\n" + (raw_pretty or "{}") + "\n```\n")
     return out_path
 
-def _show_hourglass():
-    return (
-        gr.update(visible=True),   # hourglass
-        gr.update(visible=False),  # thumbs
-        gr.update(visible=False),  # bomb
-    )
 
+# ----------------------------
+# UI
+# ----------------------------
 
-def _show_result_icon(status: str):
-    status = (status or "").lower()
-    if status == "ok":
-        return (
-            gr.update(visible=False),
-            gr.update(visible=True),
-            gr.update(visible=False),
-        )
-    return (
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=True),
-    )
-
-
-# Install mouse tracking and keep the overlays pinned to the cursor.
-# (We use Blocks.load(js=...) because <script> inside gr.HTML may be sanitized
-# depending on Gradio version / settings.)
-INIT_MOUSE_JS = r"""
-() => {
-  if (window.__rag_mouse_overlay_init__) return;
-  window.__rag_mouse_overlay_init__ = true;
-  window.__ragMouse = {x: 0, y: 0};
-
-  const ids = ['hourglass_overlay','thumb_overlay','bomb_overlay'];
-
-  const place = (id, x, y) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.style.left = (x + 16) + 'px';
-    el.style.top  = (y + 16) + 'px';
-  };
-
-  document.addEventListener('mousemove', (e) => {
-    window.__ragMouse = {x: e.clientX, y: e.clientY};
-    for (const id of ids) place(id, e.clientX, e.clientY);
-  }, {passive: true});
-
-  // Also keep updating in case components appear/disappear without a mousemove.
-  const tick = () => {
-    const pos = window.__ragMouse || {x: 0, y: 0};
-    for (const id of ids) place(id, pos.x, pos.y);
-    window.requestAnimationFrame(tick);
-  };
-  window.requestAnimationFrame(tick);
-}
-"""
-
-
-AUTO_HIDE_JS = r"""
-() => {
-  const thumb = document.getElementById('thumb_overlay');
-  const bomb  = document.getElementById('bomb_overlay');
-  const pos = window.__ragMouse || {x: 0, y: 0};
-
-  const place = (el) => {
-    if (!el) return;
-    el.style.left = (pos.x + 16) + 'px';
-    el.style.top  = (pos.y + 16) + 'px';
-  };
-
-  if (thumb) { thumb.style.display = ''; place(thumb); }
-  if (bomb)  { bomb.style.display  = ''; place(bomb); }
-
-  const isVisible = (el) => el && el.offsetParent !== null;
-
-  if (isVisible(thumb)) {
-    thumb.style.display = 'block';
-    setTimeout(() => { if (thumb) thumb.style.display = 'none'; }, 4000);
-  }
-  if (isVisible(bomb)) {
-    bomb.style.display = 'block';
-    setTimeout(() => { if (bomb) bomb.style.display = 'none'; }, 2000);
-  }
-}
-"""
-
-
-POSITION_HOURGLASS_JS = r"""
-() => {
-  const hg = document.getElementById('hourglass_overlay');
-  const pos = window.__ragMouse || {x: 0, y: 0};
-  if (hg) {
-    hg.style.left = (pos.x + 16) + 'px';
-    hg.style.top  = (pos.y + 16) + 'px';
-  }
-}
-"""
-
-
-def build_ui() -> gr.Blocks:
-    theme = gr.themes.Soft(
+def make_theme() -> gr.themes.Soft:
+    return gr.themes.Soft(
         primary_hue="blue",
         neutral_hue="slate",
         font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
     )
 
-    with gr.Blocks(title="Local RAG UI", theme=theme, css=CUSTOM_CSS) as demo:
-        # Make sure mouse-follow overlays work reliably across Gradio versions.
-        demo.load(fn=None, inputs=None, outputs=None, js=INIT_MOUSE_JS)
-        with gr.Group(elem_classes=["panel"], elem_id="app_title"):
-            gr.Markdown(
-                "# Local RAG (Gradio)\n"
-                "Ask a question and the app will POST to your local RAG Flask API."
+
+def build_ui() -> gr.Blocks:
+    # Align defaults with the running backend so the Sources panel points at
+    # the collection the API and folder_watcher are actually writing to.
+    srv = fetch_server_config(DEFAULT_API_BASE, timeout_s=2)
+    initial_embedding_id = srv.get("embedding_id") or DEFAULT_EMBEDDING_ID
+    initial_version = srv.get("version") or DEFAULT_VERSION
+
+    with gr.Blocks(title="Local RAG") as demo:
+        with gr.Row(elem_classes=["nb-header"]):
+            gr.HTML(
+                '<div>'
+                '  <h1>Local RAG</h1>'
+                '  <div class="nb-sub">Ask questions over the documents you have ingested into your local Chroma collection.</div>'
+                '</div>'
             )
 
-            with gr.Row():
-                hourglass = gr.HTML(
-                    value='<div id="hourglass_overlay" class="mouse_follow"><div class="status_icon"><span class="spin">⏳</span></div></div>',
-                    visible=False,
-                    elem_id="hourglass",
-                )
-                thumb = gr.HTML(
-                    value='<div id="thumb_overlay" class="mouse_overlay"><div class="status_icon">👍</div></div>',
-                    visible=False,
-                    elem_id="thumb",
-                )
-                bomb = gr.HTML(
-                    value='<div id="bomb_overlay" class="mouse_overlay"><div class="status_icon"><span class="boom">💥</span></div></div>',
-                    visible=False,
-                    elem_id="bomb",
-                )
-
-                # Mouse tracking for overlays (thumb + bomb)
-                gr.HTML(
-                    value="""
-<script>
-(function(){
-  if (window.__rag_mouse_overlay_init__) return;
-  window.__rag_mouse_overlay_init__ = true;
-  window.__ragMouse = {x: 0, y: 0};
-
-  function moveOverlay(id, x, y) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.style.left = (x + 16) + 'px';
-    el.style.top  = (y + 16) + 'px';
-  }
-
-  document.addEventListener('mousemove', (e) => {
-    window.__ragMouse = {x: e.clientX, y: e.clientY};
-    moveOverlay('hourglass_overlay', e.clientX, e.clientY);
-    moveOverlay('thumb_overlay', e.clientX, e.clientY);
-    moveOverlay('bomb_overlay', e.clientX, e.clientY);
-  });
-})();
-</script>
-""",
-                    visible=True,
-                )
-
-        with gr.Group(elem_classes=["panel"]):
-            gr.Markdown("## Connection & model")
-
-            with gr.Row():
-                api_base = gr.Textbox(
-                    label="API base URL",
-                    value=DEFAULT_API_BASE,
-                    placeholder="http://127.0.0.1:5000",
-                    elem_classes=["user-input"],
-                )
-                endpoint = gr.Textbox(
-                    label="Endpoint",
-                    value=DEFAULT_ENDPOINT,
-                    placeholder="answer",
-                    elem_classes=["user-input"],
-                )
-
-            with gr.Row():
-                llm_id = gr.Dropdown(
-                    label="LLM model (llm_id = provider:model)",
-                    choices=MODEL_CHOICES,
-                    value=DEFAULT_LLM_ID,
-                    allow_custom_value=True,
-                    interactive=True,
-                    elem_classes=["user-input", "user-dropdown"],
-                )
-                launch_compatible = gr.Checkbox(
-                    label="Launch.py-compatible request (send only query + llm_id)",
-                    value=True,
-                    elem_classes=["user-input"],
-                )
-
-        with gr.Accordion("Advanced retrieval options", open=False, elem_classes=["panel"]):
-            with gr.Row():
-                embedding_id = gr.Textbox(
-                    label="embedding_id", value=DEFAULT_EMBEDDING_ID, elem_classes=["user-input"]
-                )
-                version = gr.Textbox(label="version", value=DEFAULT_VERSION, elem_classes=["user-input"])
-
-            with gr.Row():
-                top_k = gr.Slider(1, 30, value=6, step=1, label="top_k", elem_classes=["user-input"])
-                fetch_k = gr.Slider(5, 80, value=24, step=1, label="fetch_k", elem_classes=["user-input"])
-
-            with gr.Row():
-                search_type = gr.Dropdown(
-                    choices=["mmr", "similarity"],
-                    value="mmr",
-                    label="search_type",
-                    elem_classes=["user-input", "user-dropdown"],
-                )
-                mmr_lambda = gr.Slider(
-                    0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda", elem_classes=["user-input"]
-                )
-
-            with gr.Row():
-                max_context_chars = gr.Slider(
-                    2000, 50000, value=18000, step=500, label="max_context_chars", elem_classes=["user-input"]
-                )
-                timeout_s = gr.Slider(
-                    5, 600, value=DEFAULT_TIMEOUT_S, step=5, label="timeout (seconds)", elem_classes=["user-input"]
-                )
-
-        last_query = gr.State("")
-        last_request = gr.State("{}")
-        last_raw = gr.State("{}")
-
-        with gr.Tabs():
-            with gr.Tab("Simple Q&A"):
-                question = gr.Textbox(
-                    label="Your question",
-                    lines=4,
-                    placeholder="Type your question here…",
-                    elem_classes=["user-input"],
-                )
-                ask_btn = gr.Button("Ask", variant="primary")
-
-                status = gr.State("")
-
-                answer_md = gr.Markdown(elem_id="answer_box", elem_classes=["api-output"])
-                with gr.Accordion("Sources (JSON)", open=False):
-                    sources_json = gr.Code(language="json", elem_classes=["api-output"])
-                with gr.Accordion("Raw API response (JSON)", open=False):
-                    raw_json = gr.Code(language="json", elem_classes=["api-output"])
-
-                with gr.Group(elem_classes=["panel"]):
-                    gr.Markdown("## Download last exchange")
-                    filename = gr.Textbox(
-                        label="Download filename",
-                        value="rag_exchange.json",
-                        placeholder="e.g. my_run.json",
-                        elem_classes=["user-input"],
+        with gr.Row():
+            # ---- Sources panel ----
+            with gr.Column(scale=3, min_width=280):
+                with gr.Group(elem_classes=["nb-side"]):
+                    with gr.Row():
+                        gr.HTML('<div class="nb-section-title">Sources</div>')
+                        status_pill = gr.HTML('<span class="nb-status-pill">checking…</span>')
+                    sources_html = gr.HTML(
+                        '<div class="nb-empty">Loading…</div>',
+                        elem_id="nb_sources",
                     )
-                    dl_btn = gr.Button("Prepare download", variant="secondary")
-                    dl_file = gr.File(label="Download", file_count="single")
+                    refresh_btn = gr.Button("Refresh sources", variant="secondary", size="sm")
 
-                dl_btn.click(
-                    fn=make_download_file,
-                    inputs=[filename, last_query, last_request, last_raw],
-                    outputs=[dl_file],
-                )
+            # ---- Chat / Q&A ----
+            with gr.Column(scale=7, min_width=420):
+                with gr.Group(elem_classes=["nb-card"]):
+                    with gr.Accordion("Connection & model", open=False):
+                        with gr.Row():
+                            api_base = gr.Textbox(
+                                label="API base URL",
+                                value=DEFAULT_API_BASE,
+                                placeholder="http://127.0.0.1:5000",
+                            )
+                            endpoint = gr.Textbox(
+                                label="Endpoint",
+                                value=DEFAULT_ENDPOINT,
+                                placeholder="answer",
+                            )
+                        with gr.Row():
+                            llm_id = gr.Dropdown(
+                                label="LLM (provider:model)",
+                                choices=MODEL_CHOICES,
+                                value=DEFAULT_LLM_ID,
+                                allow_custom_value=True,
+                                interactive=True,
+                            )
+                            launch_compatible = gr.Checkbox(
+                                label="launch.py-compatible (only query + llm_id)",
+                                value=True,
+                            )
+                        with gr.Row():
+                            embedding_id = gr.Textbox(label="embedding_id", value=initial_embedding_id)
+                            version = gr.Textbox(label="version", value=initial_version)
+                        with gr.Row():
+                            top_k = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                            fetch_k = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
+                        with gr.Row():
+                            search_type = gr.Dropdown(
+                                choices=["mmr", "similarity"], value="mmr", label="search_type",
+                            )
+                            mmr_lambda = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
+                        with gr.Row():
+                            max_context_chars = gr.Slider(
+                                2000, 50000, value=18000, step=500, label="max_context_chars",
+                            )
+                            timeout_s = gr.Slider(
+                                5, 600, value=DEFAULT_TIMEOUT_S, step=5, label="timeout (s)",
+                            )
 
-                (
-                    ask_btn.click(fn=_show_hourglass, inputs=[], outputs=[hourglass, thumb, bomb])
-                    .then(fn=lambda: None, inputs=[], outputs=[], js=POSITION_HOURGLASS_JS)
-                    .then(
-                        fn=ask_api,
-                        inputs=[
-                            question,
-                            api_base, endpoint, llm_id,
-                            embedding_id, version,
-                            top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
-                            timeout_s,
-                            launch_compatible,
-                        ],
-                        outputs=[answer_md, sources_json, raw_json, status, last_request],
-                    )
-                    .then(fn=lambda q: q, inputs=[question], outputs=[last_query])
-                    .then(fn=lambda raw: raw, inputs=[raw_json], outputs=[last_raw])
-                    .then(
-                        fn=_show_result_icon,
-                        inputs=[status],
-                        outputs=[hourglass, thumb, bomb],
-                        js=AUTO_HIDE_JS,
-                    )
-                )
+                last_query = gr.State("")
+                last_request = gr.State("{}")
+                last_raw = gr.State("{}")
 
-            with gr.Tab("Chat"):
-                gr.Markdown(
-                    "Each message is sent as a fresh `query` to the API. "
-                    "The status icons above reflect each request."
-                )
+                with gr.Tabs():
+                    with gr.Tab("Ask"):
+                        with gr.Group(elem_classes=["nb-card"]):
+                            question = gr.Textbox(
+                                label="Your question",
+                                lines=3,
+                                placeholder="What would you like to know about your documents?",
+                            )
+                            with gr.Row():
+                                ask_btn = gr.Button("Ask", variant="primary")
+                                clear_q_btn = gr.Button("Clear", variant="secondary")
+                            status = gr.State("")
+                            answer_md = gr.Markdown(elem_id="nb_answer")
+                            with gr.Accordion("Cited chunks (JSON)", open=False):
+                                sources_json = gr.Code(language="json")
+                            with gr.Accordion("Raw API response (JSON)", open=False):
+                                raw_json = gr.Code(language="json")
 
-                chatbot = gr.Chatbot(label="Conversation", height=420, elem_classes=["api-output"])
+                        with gr.Group(elem_classes=["nb-card"]):
+                            gr.HTML('<div class="nb-section-title">Download last exchange</div>')
+                            with gr.Row():
+                                filename = gr.Textbox(
+                                    label="Filename",
+                                    value="rag_exchange.md",
+                                    placeholder="e.g. my_run.md",
+                                    scale=4,
+                                )
+                                dl_btn = gr.Button("Prepare download", variant="secondary", scale=1)
+                            dl_file = gr.File(label="Download", file_count="single")
 
-                with gr.Row():
-                    chat_msg = gr.Textbox(
-                        label="Message",
-                        placeholder="Ask something…",
-                        lines=2,
-                        elem_classes=["user-input"],
-                        scale=4,
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1)
-                    clear_btn = gr.Button("Clear", scale=1)
+                        dl_btn.click(
+                            fn=make_download_file,
+                            inputs=[filename, last_query, last_request, last_raw],
+                            outputs=[dl_file],
+                        )
+                        clear_q_btn.click(fn=lambda: "", inputs=[], outputs=[question])
 
-                chat_status = gr.State("")
+                        (
+                            ask_btn.click(
+                                fn=ask_api,
+                                inputs=[
+                                    question,
+                                    api_base, endpoint, llm_id,
+                                    embedding_id, version,
+                                    top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
+                                    timeout_s, launch_compatible,
+                                ],
+                                outputs=[answer_md, sources_json, raw_json, status, last_request],
+                            )
+                            .then(fn=lambda q: q, inputs=[question], outputs=[last_query])
+                            .then(fn=lambda raw: raw, inputs=[raw_json], outputs=[last_raw])
+                        )
 
-                (
-                    send_btn.click(fn=_show_hourglass, inputs=[], outputs=[hourglass, thumb, bomb])
-                    .then(fn=lambda: None, inputs=[], outputs=[], js=POSITION_HOURGLASS_JS)
-                    .then(fn=lambda m: m, inputs=[chat_msg], outputs=[last_query])
-                    .then(
-                        fn=chat_step,
-                        inputs=[
-                            chat_msg,
-                            chatbot,
-                            api_base, endpoint, llm_id,
-                            embedding_id, version,
-                            top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
-                            timeout_s,
-                            launch_compatible,
-                        ],
-                        outputs=[chatbot, chat_status, last_request, last_raw],
-                    )
-                    .then(
-                        fn=_show_result_icon,
-                        inputs=[chat_status],
-                        outputs=[hourglass, thumb, bomb],
-                        js=AUTO_HIDE_JS,
-                    )
-                    .then(fn=lambda: "", inputs=[], outputs=[chat_msg])
-                )
+                    with gr.Tab("Chat"):
+                        with gr.Group(elem_classes=["nb-card"]):
+                            chatbot = gr.Chatbot(label="Conversation", height=440, value=[])
+                            with gr.Row():
+                                chat_msg = gr.Textbox(
+                                    label="Message",
+                                    placeholder="Ask something…",
+                                    lines=2,
+                                    scale=4,
+                                )
+                                send_btn = gr.Button("Send", variant="primary", scale=1)
+                                clear_chat_btn = gr.Button("Clear", variant="secondary", scale=1)
+                            chat_status = gr.State("")
 
-                clear_btn.click(fn=lambda: [], inputs=[], outputs=[chatbot])
+                        (
+                            send_btn.click(fn=lambda m: m, inputs=[chat_msg], outputs=[last_query])
+                            .then(
+                                fn=chat_step,
+                                inputs=[
+                                    chat_msg, chatbot,
+                                    api_base, endpoint, llm_id,
+                                    embedding_id, version,
+                                    top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
+                                    timeout_s, launch_compatible,
+                                ],
+                                outputs=[chatbot, chat_status, last_request, last_raw],
+                            )
+                            .then(fn=lambda: "", inputs=[], outputs=[chat_msg])
+                        )
+                        clear_chat_btn.click(fn=lambda: [], inputs=[], outputs=[chatbot])
 
-        gr.Markdown(
-            "### Notes\n"
-            "- The app calls `POST {API_BASE}/{endpoint}` with JSON including `query` and `llm_id`.\n"
-            "- Your API also supports `embedding_id`, `version`, `top_k`, `fetch_k`, `search_type`, `mmr_lambda`, `max_context_chars`."
+        # Wire up the Sources panel:
+        # - refresh_btn: ingest any new files in watched_folder/ then re-list /sources.
+        # - initial load: just list /sources (no implicit ingest).
+        refresh_btn.click(
+            fn=refresh_panel_with_ingest,
+            inputs=[api_base, embedding_id, version, timeout_s],
+            outputs=[sources_html, status_pill],
+        )
+        demo.load(
+            fn=refresh_sources_panel,
+            inputs=[api_base, embedding_id, version, timeout_s],
+            outputs=[sources_html, status_pill],
         )
 
     return demo
@@ -788,4 +903,4 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch()
+    demo.launch(theme=make_theme(), css=CUSTOM_CSS)

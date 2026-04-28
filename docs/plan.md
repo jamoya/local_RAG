@@ -1,4 +1,4 @@
-# Project Reorganization Plan
+2# Project Reorganization Plan
 
 Goal: split the flat repo into `backend/`, `frontend/`, `scripts/`, `docs/`
 without breaking the running stack or test suite.
