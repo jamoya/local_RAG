@@ -1,5 +1,4 @@
 .env
-/Users/jm/pythonprojects/_work/local_rag/watched_folderv
-/Users/jm/pythonprojects/_work/local_rag/files_seg
+files_seg/
 logs/
 local_chroma_db/chroma.sqlite3
