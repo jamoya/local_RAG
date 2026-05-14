@@ -10,7 +10,7 @@ Folder watcher (no n8n) that:
 Usage:
   uv run python backend/folder_watcher.py \
     --watch "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder" \
-    --api "http://127.0.0.1:5000" \
+    --api "http://127.0.0.1:5050" \
     --embedding-id "hf:BAAI/bge-large-en-v1.5" \
     --version "v1" \
     --reconcile-interval 300
@@ -107,7 +107,7 @@ def api_sources(url: str, embedding_id: str, version: str) -> Set[str]:
     r = requests.get(url, params=params, timeout=120)
     r.raise_for_status()
     data = r.json()
-    return set(data.get("source_paths", []) or [])
+    return set(data.get("sources", []) or [])
 
 
 class WatchHandler(FileSystemEventHandler):
@@ -150,6 +150,7 @@ class WatchHandler(FileSystemEventHandler):
                 return
             self.state["files"][key] = fp
             save_state(self.state_path, self.state)
+            print(f"file {p.name} added to the database")
         except requests.RequestException as e:
             print(f"[error] ingest failed for {p.name}: {e}")
 
@@ -229,7 +230,7 @@ def reconcile(cfg, handler: WatchHandler, watch_dir: Path):
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--watch", required=True, help="Folder to watch")
-    ap.add_argument("--api", default=os.environ.get("RAG_API", os.environ.get("RAG_API_BASE", "http://127.0.0.1:5000")), help="Base URL of local RAG API (or env RAG_API / RAG_API_BASE)")
+    ap.add_argument("--api", default=os.environ.get("RAG_API", os.environ.get("RAG_API_BASE", "http://127.0.0.1:5050")), help="Base URL of local RAG API (or env RAG_API / RAG_API_BASE)")
     ap.add_argument("--embedding-id", default=os.environ.get("EMBEDDING_ID", "hf:BAAI/bge-large-en-v1.5"))
     ap.add_argument("--version", default=os.environ.get("CHROMA_COLLECTION_VERSION", os.environ.get("VERSION", "v1")))
     ap.add_argument("--extensions", nargs="*", default=DEFAULT_EXTENSIONS)

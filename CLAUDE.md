@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A local RAG (retrieval-augmented generation) system with four cooperating processes and a Chroma vector store on disk.
 
-- `backend/local_rag_api.py` — Flask API (default `127.0.0.1:5000`). Endpoints: `/health`, `/ready`, `/config`, `/sources`, `/ingest` (multipart), `/ingest_folder`, `/delete`, `/retrieve`, `/answer`. Owns chunking, embeddings, vector store, retrieval and LLM call. Shared helpers `_ingest_documents` (chunk + upsert pre-loaded `Document`s) and `_ingest_local_file` (load a file from disk and ingest) are reused by both `/ingest` and `/ingest_folder`.
+- `backend/local_rag_api.py` — Flask API (default `127.0.0.1:5050`). Endpoints: `/health`, `/ready`, `/config`, `/sources`, `/ingest` (multipart), `/ingest_folder`, `/delete`, `/retrieve`, `/answer`. Owns chunking, embeddings, vector store, retrieval and LLM call. Shared helpers `_ingest_documents` (chunk + upsert pre-loaded `Document`s) and `_ingest_local_file` (load a file from disk and ingest) are reused by both `/ingest` and `/ingest_folder`.
 - `backend/folder_watcher.py` — watchdog-based daemon. Scans a folder, POSTs new/changed files to `/ingest`, calls `/delete` on removals. Keeps a per-`(version, embedding_id)` state file `.ingested_state__<version>__<slug>__<hash>.json` inside the watched folder. Optional periodic reconcile against `/sources`. Its helpers (`scan_disk`, `state_file_path`, `load_state`, `save_state`, `file_fingerprint`, `should_track`) are imported directly by `/ingest_folder` so server-driven ingests and the daemon stay in sync.
 - `frontend/launch.py` — thin CLI client. Sends `{query, llm_id}` to `/answer`.
 - `frontend/gradio_app.py` — Gradio web UI that POSTs to the same API. At startup it probes `GET /config` and auto-aligns the `embedding_id` / `version` textboxes with the running backend (falls back to env vars if the API is unreachable). The "Refresh sources" button now calls `POST /ingest_folder` against `<repo>/watched_folder` before re-listing `/sources`, so dropping a file into the watched folder and clicking refresh ingests it. Has a "launch-compatible" switch that, when on, sends only `{query, llm_id}` (matching `launch.py`); when off, also sends `embedding_id`, `version`, `top_k`, `fetch_k`, `search_type`, `mmr_lambda`, `max_context_chars`. Three tabs: **Ask** (single-shot), **Chat** (multi-turn with history), **Compare** (two-column side-by-side — same question runs against two independent configs in parallel via `compare_step`; each column has its own LLM/embeddings/retrieval knobs). The LLM dropdown includes `anthropic:claude-sonnet-4-6`, `anthropic:claude-haiku-4-5`, and `anthropic:claude-opus-4-7` alongside the existing OpenAI/Gemini/Ollama options.
@@ -61,10 +61,10 @@ uv run python frontend/launch.py --query "…" --llm-id openai:gpt-4o-mini
 uv run python frontend/gradio_app.py   # auto-aligns with backend via /config
 
 # 4. Inspect server-side defaults (no embedding model is instantiated):
-curl -s http://127.0.0.1:5000/config
+curl -s http://127.0.0.1:5050/config
 
 # 5. Trigger a one-shot folder ingest without the daemon:
-curl -s -X POST http://127.0.0.1:5000/ingest_folder \
+curl -s -X POST http://127.0.0.1:5050/ingest_folder \
   -H 'Content-Type: application/json' \
   -d '{"folder":"'"$(pwd)/watched_folder"'"}'
 ```

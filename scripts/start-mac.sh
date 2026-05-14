@@ -28,7 +28,7 @@ if [[ -f "$ROOT/.env" ]]; then
 fi
 
 API_HOST="${RAG_HOST:-127.0.0.1}"
-API_PORT="${RAG_PORT:-5000}"
+API_PORT="${RAG_PORT:-5050}"
 API_BASE="http://${API_HOST}:${API_PORT}"
 
 is_pid_alive() {

@@ -22,7 +22,7 @@ import gradio as gr
 # ----------------------------
 # Defaults
 # ----------------------------
-DEFAULT_API_BASE = os.environ.get("RAG_API", "http://127.0.0.1:5000")
+DEFAULT_API_BASE = os.environ.get("RAG_API", "http://127.0.0.1:5050")
 DEFAULT_ENDPOINT = os.environ.get("RAG_ENDPOINT", "answer")
 DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "tfidf:local")
 DEFAULT_VERSION = os.environ.get("CHROMA_COLLECTION_VERSION", "v1")
@@ -804,7 +804,7 @@ def build_ui() -> gr.Blocks:
                             api_base = gr.Textbox(
                                 label="API base URL",
                                 value=DEFAULT_API_BASE,
-                                placeholder="http://127.0.0.1:5000",
+                                placeholder="http://127.0.0.1:5050",
                             )
                             endpoint = gr.Textbox(
                                 label="Endpoint",

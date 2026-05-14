@@ -118,7 +118,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # Config
 # ----------------------------
 HOST = os.environ.get("RAG_HOST", "127.0.0.1")
-PORT = int(os.environ.get("RAG_PORT", "5000"))
+PORT = int(os.environ.get("RAG_PORT", "5050"))
 
 CHROMA_PATH = os.path.abspath(os.environ.get("CHROMA_DB_PATH", "./local_chroma_db"))
 BASE_COLLECTION = os.environ.get("CHROMA_BASE_COLLECTION_NAME", "my_local_knowledge_base")
@@ -755,6 +755,7 @@ def ingest_folder():
             ingested.append({"source_path": r["source_path"], "chunks": r["chunks_added"]})
             files_state[path_str] = fp
             save_state(state_path, state)
+            print(f"file {p.name} added to the database")
         except Exception as e:
             errors.append({"source_path": path_str, "error": f"{type(e).__name__}: {e}"})
 

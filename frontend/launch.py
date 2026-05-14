@@ -85,8 +85,8 @@ def extract_answer(payload: Any) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Query the Local RAG API.")
-    p.add_argument("--api", default=os.environ.get("RAG_API", "http://127.0.0.1:5000"),
-                   help="API base URL (default: http://127.0.0.1:5000 or env RAG_API)")
+    p.add_argument("--api", default=os.environ.get("RAG_API", "http://127.0.0.1:5050"),
+                   help="API base URL (default: http://127.0.0.1:5050 or env RAG_API)")
     p.add_argument("--endpoint", default=os.environ.get("RAG_ENDPOINT", "answer"),
                    help="Endpoint name (default: answer or env RAG_ENDPOINT)")
     p.add_argument("--query", default=None,
