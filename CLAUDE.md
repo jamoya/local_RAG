@@ -81,8 +81,8 @@ The tests rely on `CHROMA_DB_PATH`, `EMBEDDING_ID`, `LLM_ID`, and related env va
 ## Points of attention
 
 - `.env` is gitignored and contains live API keys. Never echo its contents, never commit it, and do not copy values into code or other files.
-- `watched_folder/` and `files_seg/` are gitignored (see recent commit `c75c5d4`). Don't re-add them.
-- The `local_chroma_db/` directory is *not* gitignored but some UUID subdirs appear in `git status` as untracked — leave them alone; they are Chroma's per-collection storage.
+- `watched_folder/`, `files_seg/`, `local_chroma_db/` and `__pycache__/` are gitignored. Don't re-add them.
+- `local_chroma_db/` is purely local state — Chroma's per-collection storage, rebuilt by re-ingesting. It is not versioned, so never rely on it being present in a fresh clone.
 - `CHROMA_COLLECTION_VERSION` and `EMBEDDING_ID` must be consistent between the API server and the watcher, otherwise the watcher writes into one collection and `/answer` reads from another. The Gradio UI mitigates this for itself by probing `GET /config` at startup, but the daemon still relies on its CLI args / env vars.
 - `WATCHED_FOLDER` env var (read by `local_rag_api.py`) sets the default folder used by `/ingest_folder` and surfaced in `/config`. If unset it defaults to `<CWD>/watched_folder`.
 - Supported file extensions for ingest are hardcoded in `SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}`. Add new types in both `backend/local_rag_api.py` (`/ingest` dispatch and `_ingest_local_file`) and `backend/folder_watcher.py` (`DEFAULT_EXTENSIONS`).
