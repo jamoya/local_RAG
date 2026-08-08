@@ -2,4 +2,5 @@
 files_seg/
 watched_folder/
 logs/
-local_chroma_db/chroma.sqlite3
+local_chroma_db/
+__pycache__/
