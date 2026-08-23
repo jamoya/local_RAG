@@ -334,6 +334,7 @@ def build_request_body(
     launch_compatible: bool,
     history: Optional[List[Dict[str, str]]] = None,
     reranker_id: str = "",
+    folder: str = "",
 ) -> Dict[str, Any]:
     """Construct the JSON body sent to /answer.
 
@@ -359,6 +360,7 @@ def build_request_body(
         "mmr_lambda": float(mmr_lambda),
         "max_context_chars": int(max_context_chars),
         "reranker_id": (reranker_id or "").strip(),
+        "folder": (folder or "").strip(),
     }
     if trimmed_history:
         body["history"] = trimmed_history
@@ -682,9 +684,10 @@ def ask_api(
     max_context_chars: int,
     timeout_s: int,
     launch_compatible: bool,
-    # reranker_id precedes history so the Ask tab's positional Gradio inputs
-    # bind to it; history is always passed by keyword.
+    # reranker_id and folder precede history so the Ask tab's positional Gradio
+    # inputs bind to them; history is always passed by keyword.
     reranker_id: str = "",
+    folder: str = "",
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str, str, str, str]:
     """Returns (answer_md, sources_pretty_json, raw_pretty_json, status, request_pretty_json)."""
@@ -713,6 +716,7 @@ def ask_api(
         launch_compatible=launch_compatible,
         history=history,
         reranker_id=reranker_id,
+        folder=folder,
     )
     request_pretty = json.dumps({"url": url, "body": body}, indent=2, ensure_ascii=False)
 
@@ -795,6 +799,7 @@ def chat_step(
     timeout_s: int,
     launch_compatible: bool,
     reranker_id: str = "",
+    folder: str = "",
 ) -> Tuple[List[Dict[str, str]], str, str, str]:
     message = (message or "").strip()
     history = _normalize_chat_history(history)
@@ -807,13 +812,30 @@ def chat_step(
         top_k=top_k, fetch_k=fetch_k, search_type=search_type,
         mmr_lambda=mmr_lambda, max_context_chars=max_context_chars,
         timeout_s=timeout_s, launch_compatible=launch_compatible,
-        history=history, reranker_id=reranker_id,
+        history=history, reranker_id=reranker_id, folder=folder,
     )
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": answer_md})
     if len(history) > CHAT_HISTORY_MAX_MSGS:
         history = history[-CHAT_HISTORY_MAX_MSGS:]
     return history, status, request_pretty, raw_pretty
+
+
+def _scoped_folder(restrict: bool, folder: str) -> str:
+    """The folder to scope retrieval by; blank means search every folder."""
+    return (folder or "") if restrict else ""
+
+
+def ask_scoped(*args):
+    """ask_api with the last two Gradio inputs collapsed into one folder argument."""
+    *head, restrict, folder = args
+    return ask_api(*head, _scoped_folder(restrict, folder))
+
+
+def chat_scoped(*args):
+    """chat_step with the last two Gradio inputs collapsed into one folder argument."""
+    *head, restrict, folder = args
+    return chat_step(*head, _scoped_folder(restrict, folder))
 
 
 def compare_step(
@@ -959,6 +981,10 @@ def build_ui() -> gr.Blocks:
                                 label="launch.py-compatible (only query + llm_id)",
                                 value=False,
                             )
+                            restrict_to_folder = gr.Checkbox(
+                                label="restrict retrieval to active folder",
+                                value=True,
+                            )
                         with gr.Row():
                             embedding_id = gr.Textbox(label="embedding_id", value=initial_embedding_id)
                             version = gr.Textbox(label="version", value=initial_version)
@@ -1034,13 +1060,14 @@ def build_ui() -> gr.Blocks:
 
                         (
                             ask_btn.click(
-                                fn=ask_api,
+                                fn=ask_scoped,
                                 inputs=[
                                     question,
                                     api_base, endpoint, llm_id,
                                     embedding_id, version,
                                     top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
                                     timeout_s, launch_compatible, reranker_id,
+                                    restrict_to_folder, folder_choice,
                                 ],
                                 outputs=[answer_md, sources_json, raw_json, status, last_request],
                             )
@@ -1065,13 +1092,14 @@ def build_ui() -> gr.Blocks:
                         (
                             send_btn.click(fn=lambda m: m, inputs=[chat_msg], outputs=[last_query])
                             .then(
-                                fn=chat_step,
+                                fn=chat_scoped,
                                 inputs=[
                                     chat_msg, chatbot,
                                     api_base, endpoint, llm_id,
                                     embedding_id, version,
                                     top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
                                     timeout_s, launch_compatible, reranker_id,
+                                    restrict_to_folder, folder_choice,
                                 ],
                                 outputs=[chatbot, chat_status, last_request, last_raw],
                             )

@@ -923,3 +923,86 @@ def test_ask_api_binds_reranker_id_before_history():
 def test_model_choices_include_local_generators():
     assert "ollama:qwen3:30b" in ga.MODEL_CHOICES
     assert "lmstudio:google/gemma-4-12b-qat" in ga.MODEL_CHOICES
+
+
+# ----------------------------
+# restrict retrieval to the active folder
+# ----------------------------
+
+def test_build_request_body_includes_folder():
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=False, folder="/data/alpha",
+    )
+    assert body["folder"] == "/data/alpha"
+
+
+def test_build_request_body_omits_blank_folder():
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=False, folder="",
+    )
+    assert "folder" not in body
+
+
+def test_launch_compatible_still_drops_folder():
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=True, folder="/data/alpha",
+    )
+    assert body == {"query": "q", "llm_id": "mock:any"}
+
+
+def test_scoped_folder_blanks_when_unrestricted():
+    assert ga._scoped_folder(True, "/data/alpha") == "/data/alpha"
+    assert ga._scoped_folder(False, "/data/alpha") == ""
+    assert ga._scoped_folder(True, "") == ""
+
+
+def test_ask_scoped_forwards_the_folder_positionally():
+    """The last two Gradio inputs must collapse into ask_api's folder argument."""
+    captured = {}
+
+    def fake_ask_api(*args):
+        captured["args"] = args
+        return ("a", "b", "c", "d", "e")
+
+    with patch.object(ga, "ask_api", fake_ask_api):
+        ga.ask_scoped("q", "http://api", "answer", "mock:any", "fake:any", "v1",
+                      6, 24, "mmr", 0.3, 18000, 120, False, "none:", True, "/data/alpha")
+
+    assert captured["args"][-1] == "/data/alpha"
+    assert captured["args"][0] == "q"
+    assert captured["args"][-2] == "none:"
+
+
+def test_ask_scoped_sends_no_folder_when_the_box_is_unticked():
+    captured = {}
+
+    def fake_ask_api(*args):
+        captured["args"] = args
+        return ("a", "b", "c", "d", "e")
+
+    with patch.object(ga, "ask_api", fake_ask_api):
+        ga.ask_scoped("q", "http://api", "answer", "mock:any", "fake:any", "v1",
+                      6, 24, "mmr", 0.3, 18000, 120, False, "none:", False, "/data/alpha")
+
+    assert captured["args"][-1] == ""
+
+
+def test_chat_scoped_forwards_the_folder_positionally():
+    captured = {}
+
+    def fake_chat_step(*args):
+        captured["args"] = args
+        return ([], "ok", "{}", "{}")
+
+    with patch.object(ga, "chat_step", fake_chat_step):
+        ga.chat_scoped("msg", [], "http://api", "answer", "mock:any", "fake:any", "v1",
+                       6, 24, "mmr", 0.3, 18000, 120, False, "none:", True, "/data/beta")
+
+    assert captured["args"][-1] == "/data/beta"
+    assert captured["args"][0] == "msg"
