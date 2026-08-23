@@ -1006,3 +1006,82 @@ def test_chat_scoped_forwards_the_folder_positionally():
 
     assert captured["args"][-1] == "/data/beta"
     assert captured["args"][0] == "msg"
+
+
+# ----------------------------
+# the Gradio callbacks build_ui registers (reached through demo.fns)
+# ----------------------------
+
+def _built_callbacks():
+    """Build the UI offline and return its registered folder callbacks by name."""
+    import requests as _rq
+    with patch("requests.get", side_effect=_rq.ConnectionError("offline")):
+        demo = ga.build_ui()
+    return {
+        f.fn.__name__: f.fn
+        for f in demo.fns.values()
+        if getattr(f.fn, "__name__", "") in ("on_load", "on_use_folder")
+    }
+
+
+class _StubResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_on_load_populates_both_panels_and_the_dropdown(tmp_path):
+    real = tmp_path / "a.pdf"
+    real.write_text("x")
+    folder = str(tmp_path)
+
+    def fake_get(url, params=None, timeout=None):
+        if "/folders" in url:
+            return _StubResp({
+                "active": folder, "chroma_path": "/db",
+                "folders": [{"path": folder, "exists": True, "file_count": 2},
+                            {"path": "/data/beta", "exists": False, "file_count": 1}],
+            })
+        return _StubResp({"sources": [str(real)], "collection": "kb"})
+
+    cbs = _built_callbacks()
+    with patch("requests.get", fake_get):
+        folders_html, panel, pill, update = cbs["on_load"]("http://api", "fake:any", "v1", 5, "/fallback")
+
+    assert folder in folders_html and "ACTIVE" in folders_html
+    assert "a.pdf" in panel
+    assert "connected" in pill
+    assert update.get("value") == folder
+    assert len(update.get("choices")) == 2
+
+
+def test_on_use_folder_reports_the_sync_and_moves_the_dropdown(tmp_path):
+    real = tmp_path / "a.pdf"
+    real.write_text("x")
+    folder = str(tmp_path)
+
+    def fake_get(url, params=None, timeout=None):
+        if "/folders" in url:
+            return _StubResp({"active": folder, "chroma_path": "/db",
+                              "folders": [{"path": folder, "exists": True, "file_count": 1}]})
+        return _StubResp({"sources": [str(real)], "collection": "kb"})
+
+    def fake_post(url, json=None, timeout=None):
+        assert url.endswith("/watched_folder")
+        return _StubResp({"status": "ok", "active_folder": folder,
+                          "ingested": [{"chunks": 3}], "deleted": ["/gone.txt"],
+                          "skipped_unchanged": 1, "errors": []})
+
+    cbs = _built_callbacks()
+    with patch("requests.get", fake_get), patch("requests.post", fake_post):
+        folders_html, panel, pill, update = cbs["on_use_folder"]("http://api", folder, "fake:any", "v1", 5)
+
+    assert "Ingested 1 new file" in panel
+    assert "1 removed" in panel
+    assert update.get("value") == folder
+    assert folder in folders_html
