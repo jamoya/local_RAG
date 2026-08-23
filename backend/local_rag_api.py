@@ -158,6 +158,12 @@ WATCHED_FOLDER = os.path.abspath(
 
 app = Flask(__name__)
 
+_ACTIVE: Dict[str, str] = {
+    "folder": folder_registry.active_folder(CHROMA_PATH, WATCHED_FOLDER),
+    "embedding_id": DEFAULT_EMBEDDING_ID,
+    "version": DEFAULT_VERSION,
+}
+
 # ----------------------------
 # Utilities
 # ----------------------------
@@ -939,6 +945,29 @@ def ingest_folder():
         "backend": backend,
         **res,
     })
+
+
+@app.post("/watched_folder")
+def watched_folder():
+    """Make a folder the active one: validate, persist, reconcile, repoint the watcher."""
+    payload = request.get_json(silent=True) or {}
+    folder = payload.get("folder")
+    if not folder:
+        return jsonify({"error": "folder is required"}), 400
+
+    folder_path = Path(folder).expanduser().resolve()
+    if not folder_path.is_dir():
+        return jsonify({"error": f"folder not found or not a directory: {folder}"}), 400
+
+    embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
+    version = payload.get("version", DEFAULT_VERSION)
+
+    folder_registry.set_active(CHROMA_PATH, str(folder_path))
+    _ACTIVE.update({"folder": str(folder_path), "embedding_id": embedding_id, "version": version})
+
+    res = sync_folder(str(folder_path), embedding_id, version)
+    return jsonify({"status": "ok", "active_folder": str(folder_path),
+                    "embedding_id": embedding_id, "version": version, **res})
 
 @app.post("/retrieve")
 def retrieve():

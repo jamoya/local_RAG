@@ -712,3 +712,34 @@ def test_folders_includes_a_known_folder_with_no_documents(client, tmp_path):
     js = client.get("/folders?embedding_id=fake:any&version=vtest").get_json()
     by_path = {f["path"]: f for f in js["folders"]}
     assert by_path[str(empty.resolve())]["file_count"] == 0
+
+
+# ----------------------------
+# /watched_folder
+# ----------------------------
+
+def test_watched_folder_sets_active_and_syncs(client, tmp_path):
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.txt").write_text("dust limit is 5 mg per normal cubic metre")
+
+    r = client.post("/watched_folder", json={"folder": str(folder), "embedding_id": "fake:any", "version": "vtest"})
+    assert r.status_code == 200, r.data
+    js = r.get_json()
+    assert js["active_folder"] == str(folder.resolve())
+    assert len(js["ingested"]) == 1
+    assert client.get("/config").get_json()["active_folder"] == str(folder.resolve())
+
+
+def test_watched_folder_rejects_a_non_directory(client, tmp_path):
+    missing = tmp_path / "nope"
+    r = client.post("/watched_folder", json={"folder": str(missing)})
+    assert r.status_code == 400
+    assert "not a directory" in r.get_json()["error"]
+
+
+def test_watched_folder_rejects_a_file_path(client, tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("not a folder")
+    r = client.post("/watched_folder", json={"folder": str(f)})
+    assert r.status_code == 400
