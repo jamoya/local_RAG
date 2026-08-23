@@ -11,7 +11,7 @@ Usage:
   uv run python backend/folder_watcher.py \
     --watch "/Users/jm/PythonProjects/_WORK/Local_RAG/watched_folder" \
     --api "http://127.0.0.1:5050" \
-    --embedding-id "hf:BAAI/bge-large-en-v1.5" \
+    --embedding-id "ollama:qllama/bge-m3:latest" \
     --version "v1" \
     --reconcile-interval 300
 
@@ -231,7 +231,7 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--watch", required=True, help="Folder to watch")
     ap.add_argument("--api", default=os.environ.get("RAG_API", os.environ.get("RAG_API_BASE", "http://127.0.0.1:5050")), help="Base URL of local RAG API (or env RAG_API / RAG_API_BASE)")
-    ap.add_argument("--embedding-id", default=os.environ.get("EMBEDDING_ID", "hf:BAAI/bge-large-en-v1.5"))
+    ap.add_argument("--embedding-id", default=os.environ.get("EMBEDDING_ID", "ollama:qllama/bge-m3:latest"))
     ap.add_argument("--version", default=os.environ.get("CHROMA_COLLECTION_VERSION", os.environ.get("VERSION", "v1")))
     ap.add_argument("--extensions", nargs="*", default=DEFAULT_EXTENSIONS)
     ap.add_argument("--recursive", action="store_true", help="Watch subfolders too")

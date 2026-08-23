@@ -25,6 +25,7 @@ import gradio as gr
 DEFAULT_API_BASE = os.environ.get("RAG_API", "http://127.0.0.1:5050")
 DEFAULT_ENDPOINT = os.environ.get("RAG_ENDPOINT", "answer")
 DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "tfidf:local")
+DEFAULT_RERANKER_ID = os.environ.get("RERANKER_ID", "none:")
 DEFAULT_VERSION = os.environ.get("CHROMA_COLLECTION_VERSION", "v1")
 DEFAULT_LLM_ID = os.environ.get("LLM_ID", "openai:gpt-4o-mini")
 DEFAULT_TIMEOUT_S = int(os.environ.get("RAG_TIMEOUT", "120"))
@@ -43,7 +44,15 @@ MODEL_CHOICES = [
     "anthropic:claude-sonnet-4-6",
     "anthropic:claude-haiku-4-5",
     "anthropic:claude-opus-4-7",
+    # Local generators served by Ollama.
+    "ollama:qwen3:30b",
+    "ollama:gpt-oss:20b",
+    "ollama:gemma4:31b-mlx",
     "ollama:llama3.2",
+    # Local generators served by LM Studio (needs its server started).
+    "lmstudio:google/gemma-4-12b-qat",
+    "lmstudio:qwen/qwen3.6-27b",
+    "lmstudio:mistralai/magistral-small-2509",
     "mock:any",
 ]
 
@@ -302,6 +311,7 @@ def build_request_body(
     max_context_chars: int,
     launch_compatible: bool,
     history: Optional[List[Dict[str, str]]] = None,
+    reranker_id: str = "",
 ) -> Dict[str, Any]:
     """Construct the JSON body sent to /answer.
 
@@ -326,6 +336,7 @@ def build_request_body(
         "search_type": (search_type or "").strip(),
         "mmr_lambda": float(mmr_lambda),
         "max_context_chars": int(max_context_chars),
+        "reranker_id": (reranker_id or "").strip(),
     }
     if trimmed_history:
         body["history"] = trimmed_history
@@ -568,6 +579,9 @@ def ask_api(
     max_context_chars: int,
     timeout_s: int,
     launch_compatible: bool,
+    # reranker_id precedes history so the Ask tab's positional Gradio inputs
+    # bind to it; history is always passed by keyword.
+    reranker_id: str = "",
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str, str, str, str]:
     """Returns (answer_md, sources_pretty_json, raw_pretty_json, status, request_pretty_json)."""
@@ -595,6 +609,7 @@ def ask_api(
         max_context_chars=max_context_chars,
         launch_compatible=launch_compatible,
         history=history,
+        reranker_id=reranker_id,
     )
     request_pretty = json.dumps({"url": url, "body": body}, indent=2, ensure_ascii=False)
 
@@ -676,6 +691,7 @@ def chat_step(
     max_context_chars: int,
     timeout_s: int,
     launch_compatible: bool,
+    reranker_id: str = "",
 ) -> Tuple[List[Dict[str, str]], str, str, str]:
     message = (message or "").strip()
     history = _normalize_chat_history(history)
@@ -688,7 +704,7 @@ def chat_step(
         top_k=top_k, fetch_k=fetch_k, search_type=search_type,
         mmr_lambda=mmr_lambda, max_context_chars=max_context_chars,
         timeout_s=timeout_s, launch_compatible=launch_compatible,
-        history=history,
+        history=history, reranker_id=reranker_id,
     )
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": answer_md})
@@ -711,6 +727,7 @@ def compare_step(
     llm_id_b: str, embedding_id_b: str, version_b: str,
     top_k_b: int, fetch_k_b: int, search_type_b: str,
     mmr_lambda_b: float, max_context_chars_b: int,
+    reranker_id_a: str = "", reranker_id_b: str = "",
 ) -> Tuple[str, str, str, str, str, str]:
     """Run the same question against two configs in parallel.
 
@@ -720,7 +737,7 @@ def compare_step(
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    def _one(llm_id, embedding_id, version, top_k, fetch_k, search_type, mmr_lambda, max_context_chars):
+    def _one(llm_id, embedding_id, version, top_k, fetch_k, search_type, mmr_lambda, max_context_chars, reranker_id):
         return ask_api(
             question=question,
             api_base=api_base, endpoint=endpoint, llm_id=llm_id,
@@ -728,12 +745,12 @@ def compare_step(
             top_k=top_k, fetch_k=fetch_k, search_type=search_type,
             mmr_lambda=mmr_lambda, max_context_chars=max_context_chars,
             timeout_s=timeout_s, launch_compatible=launch_compatible,
-            history=None,
+            history=None, reranker_id=reranker_id,
         )
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        fa = ex.submit(_one, llm_id_a, embedding_id_a, version_a, top_k_a, fetch_k_a, search_type_a, mmr_lambda_a, max_context_chars_a)
-        fb = ex.submit(_one, llm_id_b, embedding_id_b, version_b, top_k_b, fetch_k_b, search_type_b, mmr_lambda_b, max_context_chars_b)
+        fa = ex.submit(_one, llm_id_a, embedding_id_a, version_a, top_k_a, fetch_k_a, search_type_a, mmr_lambda_a, max_context_chars_a, reranker_id_a)
+        fb = ex.submit(_one, llm_id_b, embedding_id_b, version_b, top_k_b, fetch_k_b, search_type_b, mmr_lambda_b, max_context_chars_b, reranker_id_b)
         ans_a, src_a, raw_a, _, _ = fa.result()
         ans_b, src_b, raw_b, _, _ = fb.result()
 
@@ -773,6 +790,7 @@ def build_ui() -> gr.Blocks:
     srv = fetch_server_config(DEFAULT_API_BASE, timeout_s=2)
     initial_embedding_id = srv.get("embedding_id") or DEFAULT_EMBEDDING_ID
     initial_version = srv.get("version") or DEFAULT_VERSION
+    initial_reranker_id = srv.get("reranker_id") or DEFAULT_RERANKER_ID
 
     with gr.Blocks(title="Local RAG") as demo:
         with gr.Row(elem_classes=["nb-header"]):
@@ -841,6 +859,11 @@ def build_ui() -> gr.Blocks:
                             timeout_s = gr.Slider(
                                 5, 600, value=DEFAULT_TIMEOUT_S, step=5, label="timeout (s)",
                             )
+                        with gr.Row():
+                            reranker_id = gr.Textbox(
+                                label="reranker_id", value=initial_reranker_id,
+                                placeholder="none: or ce:BAAI/bge-reranker-v2-m3",
+                            )
 
                 last_query = gr.State("")
                 last_request = gr.State("{}")
@@ -891,7 +914,7 @@ def build_ui() -> gr.Blocks:
                                     api_base, endpoint, llm_id,
                                     embedding_id, version,
                                     top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
-                                    timeout_s, launch_compatible,
+                                    timeout_s, launch_compatible, reranker_id,
                                 ],
                                 outputs=[answer_md, sources_json, raw_json, status, last_request],
                             )
@@ -922,7 +945,7 @@ def build_ui() -> gr.Blocks:
                                     api_base, endpoint, llm_id,
                                     embedding_id, version,
                                     top_k, fetch_k, search_type, mmr_lambda, max_context_chars,
-                                    timeout_s, launch_compatible,
+                                    timeout_s, launch_compatible, reranker_id,
                                 ],
                                 outputs=[chatbot, chat_status, last_request, last_raw],
                             )
@@ -969,6 +992,10 @@ def build_ui() -> gr.Blocks:
                                     max_context_chars_a = gr.Slider(
                                         2000, 50000, value=18000, step=500, label="max_context_chars",
                                     )
+                                    reranker_id_a = gr.Textbox(
+                                        label="reranker_id", value=initial_reranker_id,
+                                        placeholder="none: or ce:BAAI/bge-reranker-v2-m3",
+                                    )
                                     answer_a = gr.Markdown()
                                     with gr.Accordion("Cited chunks (JSON)", open=False):
                                         sources_a_json = gr.Code(language="json")
@@ -997,6 +1024,10 @@ def build_ui() -> gr.Blocks:
                                     max_context_chars_b = gr.Slider(
                                         2000, 50000, value=18000, step=500, label="max_context_chars",
                                     )
+                                    reranker_id_b = gr.Textbox(
+                                        label="reranker_id", value=initial_reranker_id,
+                                        placeholder="none: or ce:BAAI/bge-reranker-v2-m3",
+                                    )
                                     answer_b = gr.Markdown()
                                     with gr.Accordion("Cited chunks (JSON)", open=False):
                                         sources_b_json = gr.Code(language="json")
@@ -1011,6 +1042,7 @@ def build_ui() -> gr.Blocks:
                                 top_k_a, fetch_k_a, search_type_a, mmr_lambda_a, max_context_chars_a,
                                 llm_id_b, embedding_id_b, version_b,
                                 top_k_b, fetch_k_b, search_type_b, mmr_lambda_b, max_context_chars_b,
+                                reranker_id_a, reranker_id_b,
                             ],
                             outputs=[answer_a, sources_a_json, raw_a_json, answer_b, sources_b_json, raw_b_json],
                         )

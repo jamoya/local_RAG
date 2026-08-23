@@ -4,6 +4,7 @@ sys.path.insert(0, str(_P(__file__).resolve().parent))
 
 import os
 import io
+import re
 import importlib
 from pathlib import Path
 
@@ -235,6 +236,158 @@ def test_make_llm_anthropic_returns_chat_anthropic(tmp_path):
     llm = mod.make_llm("anthropic:claude-sonnet-4-5")
     assert llm.__class__.__name__ == "ChatAnthropic"
     assert getattr(llm, "model", None) or getattr(llm, "model_name", None)
+
+
+def test_answer_reports_empty_content_instead_of_object_dump(client, tmp_path, monkeypatch):
+    """A model that spends its whole budget on reasoning returns content=''.
+
+    The old `content or str(resp)` fallback dumped the raw AIMessage repr, which
+    hid the cause. Assert the reply names the token limit instead.
+    """
+    import local_rag_api as mod
+
+    class _Resp:
+        content = ""
+        response_metadata = {"token_usage": {"completion_tokens": 6585, "total_tokens": 8192}}
+
+    monkeypatch.setattr(mod, "make_llm", lambda _id: type("L", (), {"invoke": lambda s, m: _Resp()})())
+    (tmp_path / "a.txt").write_text("acetic acid", encoding="utf-8")
+    client.post("/ingest_folder", json={"folder": str(tmp_path), "embedding_id": "fake:any", "version": "vtest"})
+
+    js = client.post("/answer", json={"query": "q", "llm_id": "lmstudio:x"}).get_json()
+    assert "empty answer" in js["answer"]
+    assert "8192" in js["answer"]
+    assert "additional_kwargs" not in js["answer"]
+
+
+def test_sources_pages_instead_of_one_huge_get(tmp_path):
+    """Chroma's SQLite backend fails past ~32k bound variables.
+
+    /sources must page rather than ask for everything at once, so simulate a
+    collection that rejects large limits and assert it still returns all rows.
+    """
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    class _Collection:
+        MAX = 20000
+
+        def __init__(self, n):
+            self.rows = [{"source_path": f"/docs/f{i}.pdf"} for i in range(n)]
+            self.max_limit_seen = 0
+
+        def get(self, include=None, limit=None, offset=0):
+            self.max_limit_seen = max(self.max_limit_seen, limit or 0)
+            if (limit or 0) > self.MAX:
+                raise RuntimeError("too many SQL variables")
+            return {"metadatas": self.rows[offset:offset + limit]}
+
+    class _Store:
+        def __init__(self, coll):
+            self._collection = coll
+
+    coll = _Collection(45000)
+    monkey = lambda *a, **k: (_Store(coll), None, "c", "chroma")
+    original = mod.get_store
+    mod.get_store = monkey
+    try:
+        r = app.test_client().get("/sources")
+        assert r.status_code == 200
+        assert len(r.get_json()["sources"]) == 45000
+        assert coll.max_limit_seen <= _Collection.MAX
+    finally:
+        mod.get_store = original
+
+
+def test_reranker_disabled_by_default(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+    import reranker
+
+    assert mod.DEFAULT_RERANKER_ID == "none:"
+    assert reranker.make_reranker("none:") is None
+    assert reranker.make_reranker("") is None
+
+
+def test_reranker_rejects_unknown_provider():
+    import reranker
+
+    with pytest.raises(ValueError, match="Unsupported reranker provider"):
+        reranker.make_reranker("bogus:model")
+    with pytest.raises(ValueError, match="requires a model name"):
+        reranker.make_reranker("ce:")
+
+
+def test_rerank_reorders_by_score_and_truncates():
+    import reranker
+
+    class _Doc:
+        def __init__(self, text):
+            self.page_content = text
+            self.metadata = {}
+
+    class _Stub:
+        """Scores by position of the query term: later match -> lower score."""
+        def predict(self, pairs):
+            return [10.0 if "match" in text else 1.0 for _, text in pairs]
+
+    docs = [_Doc("no"), _Doc("match here"), _Doc("no"), _Doc("match too")]
+    out = reranker.rerank(_Stub(), "q", docs, top_k=2)
+    assert [d.page_content for d in out] == ["match here", "match too"]
+
+    # Disabled reranker is a pass-through that still honours top_k.
+    assert reranker.rerank(None, "q", docs, top_k=3) == docs[:3]
+    assert reranker.rerank(_Stub(), "q", [], top_k=3) == []
+
+
+def test_retrieve_endpoint_echoes_reranker_id(client, tmp_path):
+    (tmp_path / "a.txt").write_text("electric arc furnace dust limit", encoding="utf-8")
+    client.post("/ingest_folder", json={
+        "folder": str(tmp_path), "embedding_id": "fake:any", "version": "vtest",
+    })
+    r = client.post("/retrieve", json={"query": "dust limit", "top_k": 2})
+    assert r.status_code == 200
+    assert r.get_json()["reranker_id"] == "none:"
+
+
+def test_config_exposes_reranker_id(client):
+    assert client.get("/config").get_json()["reranker_id"] == "none:"
+
+
+def test_make_llm_lmstudio_targets_local_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key-must-not-leak")
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    if mod.ChatOpenAI is None:
+        pytest.skip("langchain-openai not installed in this env")
+    llm = mod.make_llm("lmstudio:google/gemma-4-12b-qat")
+    assert llm.__class__.__name__ == "ChatOpenAI"
+    assert llm.model_name == "google/gemma-4-12b-qat"
+    assert "1234" in str(llm.openai_api_base)
+    assert llm.openai_api_key.get_secret_value() == "lm-studio"
+
+
+def test_make_embeddings_ollama_returns_ollama_embeddings(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    if mod.OllamaEmbeddings is None:
+        pytest.skip("langchain-ollama not installed in this env")
+    emb = mod.make_embeddings("ollama:qllama/bge-m3:latest")
+    assert emb.__class__.__name__ == "OllamaEmbeddings"
+    assert emb.model == "qllama/bge-m3:latest"
+
+
+def test_ollama_embedding_id_gets_its_own_collection(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    ollama_name = mod._collection_name("ollama:qllama/bge-m3:latest", "v1")
+    hf_name = mod._collection_name("hf:BAAI/bge-large-en-v1.5", "v1")
+    assert ollama_name != hf_name
+    # Chroma requires alphanumeric first/last char and no other punctuation.
+    assert re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]+[a-zA-Z0-9]", ollama_name)
 
 
 def test_ingest_folder_skips_unchanged_on_second_call(client, tmp_path):

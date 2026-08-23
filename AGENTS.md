@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex when working with code in this repository.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Vector persistence: Chroma under `CHROMA_DB_PATH` (default `./local_chroma_db`).
 
 Both embeddings and LLMs use `provider:model` strings.
 
-- `embedding_id`: `tfidf:local` (fallback, always works), `fake:<anything>` (tests), `hf:<hf-model>` (e.g. `hf:BAAI/bge-large-en-v1.5`, `hf:intfloat/e5-large-v2`), `ollama:<model>` (e.g. `ollama:qllama/bge-m3:latest`, `ollama:nomic-embed-text:v1.5` — needs a running Ollama server). `openai:` / `gemini:` prefixes are parsed but not wired to real embedding classes — `make_embeddings` raises for them.
+- `embedding_id`: `tfidf:local` (fallback, always works), `fake:<anything>` (tests), `hf:<hf-model>` (e.g. `hf:BAAI/bge-large-en-v1.5`, `hf:intfloat/e5-large-v2`). `openai:` / `gemini:` / `ollama:` prefixes are parsed but not wired to real embedding classes — `make_embeddings` raises for them.
 - `llm_id`: `mock:any` (tests), `ollama:<model>`, `openai:<model>`, `gemini:<model>`, `anthropic:<model>`, `lmstudio:<model>` (OpenAI-compatible LM Studio server, base URL from `LMSTUDIO_BASE_URL`, default `http://localhost:1234/v1`) (e.g. `anthropic:claude-sonnet-4-5`). Requires the matching API key env var on the *server* process. For Anthropic, `ANTHROPIC_MAX_TOKENS` (default 4096) caps the response. When `llm_id` starts with `anthropic:`, `/answer` splits the user prompt and tags the system + retrieved-context blocks with `cache_control: {"type": "ephemeral"}` so re-running the same query against multiple Claude configs (the comparison flow) hits Anthropic's prompt cache. Per-provider cache stays warm for 5 minutes; minimum cacheable prefix is 2048 tokens (Sonnet) / 4096 tokens (Haiku/Opus).
 
 LM Studio models must be **loaded with a context long enough for RAG prompts**. LM Studio defaults to a small context (8192) even for models supporting far more; a reasoning model can then spend its whole budget before emitting any content and `/answer` returns an empty-answer notice. Raise the context length when loading the model in LM Studio.
@@ -43,10 +43,7 @@ Chunk IDs are `sha256(f"{source_path}|{page}|{chunk}")[:24]` — deterministic, 
 Running the stack (three terminals, typically):
 
 ```bash
-# 0. One-shot launcher (API + watcher + Gradio UI in background, see scripts/):
-#    UI on http://127.0.0.1:7860, API on http://127.0.0.1:5050 (the API has no
-#    `/` route -- browsing port 5050 returns 404). Override the UI address with
-#    GRADIO_SERVER_NAME / GRADIO_SERVER_PORT.
+# 0. One-shot launcher (API + watcher in background, see scripts/):
 bash scripts/start-mac.sh
 bash scripts/stop-mac.sh
 
@@ -68,7 +65,6 @@ uv run python backend/folder_watcher.py \
 # 3. Query via CLI or UI:
 uv run python frontend/launch.py --query "…" --llm-id openai:gpt-4o-mini
 uv run python frontend/gradio_app.py   # auto-aligns with backend via /config
-                                       # (start-mac.sh already runs this)
 
 # 4. Inspect server-side defaults (no embedding model is instantiated):
 curl -s http://127.0.0.1:5050/config
@@ -91,8 +87,8 @@ The tests rely on `CHROMA_DB_PATH`, `EMBEDDING_ID`, `LLM_ID`, and related env va
 ## Points of attention
 
 - `.env` is gitignored and contains live API keys. Never echo its contents, never commit it, and do not copy values into code or other files.
-- `watched_folder/`, `files_seg/`, `local_chroma_db/` and `__pycache__/` are gitignored. Don't re-add them.
-- `local_chroma_db/` is purely local state — Chroma's per-collection storage, rebuilt by re-ingesting. It is not versioned, so never rely on it being present in a fresh clone.
+- `watched_folder/` and `files_seg/` are gitignored (see recent commit `c75c5d4`). Don't re-add them.
+- The `local_chroma_db/` directory is *not* gitignored but some UUID subdirs appear in `git status` as untracked — leave them alone; they are Chroma's per-collection storage.
 - `CHROMA_COLLECTION_VERSION` and `EMBEDDING_ID` must be consistent between the API server and the watcher, otherwise the watcher writes into one collection and `/answer` reads from another. The Gradio UI mitigates this for itself by probing `GET /config` at startup, but the daemon still relies on its CLI args / env vars.
 - `WATCHED_FOLDER` env var (read by `local_rag_api.py`) sets the default folder used by `/ingest_folder` and surfaced in `/config`. If unset it defaults to `<CWD>/watched_folder`.
 - Supported file extensions for ingest are hardcoded in `SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}`. Add new types in both `backend/local_rag_api.py` (`/ingest` dispatch and `_ingest_local_file`) and `backend/folder_watcher.py` (`DEFAULT_EXTENSIONS`).

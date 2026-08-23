@@ -1,0 +1,38 @@
+[project]
+name = "local-rag"
+version = "0.1.0"
+description = "Local retrieval-augmented generation stack: Flask API, folder watcher, CLI and Gradio clients."
+requires-python = ">=3.12"
+
+dependencies = [
+    "flask>=3.1",
+    "requests>=2.32",
+    "watchdog>=6.0",
+    "scikit-learn>=1.8",
+    "gradio>=6.5",
+    "chromadb>=1.4",
+    "pypdf>=6.6",
+    "python-docx>=1.2",
+    "sentence-transformers>=5.2",
+    "langchain>=1.2",
+    "langchain-core>=1.4",
+    "langchain-chroma>=1.1",
+    "langchain-text-splitters>=1.1",
+    "langchain-huggingface>=1.2",
+    "langchain-openai>=1.1",
+    "langchain-anthropic>=1.4",
+    "langchain-google-genai>=4.2",
+    "langchain-ollama>=1.0",
+    # Source of PyPDFLoader. 1.0.0a1 was yanked from PyPI, so uv cannot
+    # resolve it; 0.4.2 is the latest release and works with langchain 1.x.
+    "langchain-community>=0.4.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "reportlab>=4.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend", "frontend"]

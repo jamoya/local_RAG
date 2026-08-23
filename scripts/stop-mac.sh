@@ -33,8 +33,17 @@ stop_pid_file() {
   rm -f "$pid_file"
 }
 
+stop_pid_file "ui"      "$LOG_DIR/ui.pid"
 stop_pid_file "watcher" "$LOG_DIR/watcher.pid"
 stop_pid_file "api"     "$LOG_DIR/api.pid"
+
+# Only present when start-mac.sh had to start Ollama itself. An Ollama the user
+# was already running (or the desktop app) has no pid file and is left alone.
+if [[ -f "$LOG_DIR/ollama.pid" ]]; then
+  stop_pid_file "ollama" "$LOG_DIR/ollama.pid"
+else
+  echo "ollama: not started by us -- leaving it running"
+fi
 
 # Fallback: catch any leftover instances started outside start-mac.sh.
 for pat in "backend/local_rag_api.py" "backend/folder_watcher.py" "frontend/gradio_app.py"; do

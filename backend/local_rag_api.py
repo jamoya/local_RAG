@@ -103,6 +103,11 @@ except Exception:  # pragma: no cover
     HuggingFaceEmbeddings = None  # type: ignore
 
 try:
+    from langchain_ollama import OllamaEmbeddings  # type: ignore
+except Exception:  # pragma: no cover
+    OllamaEmbeddings = None  # type: ignore
+
+try:
     from langchain_core.embeddings import FakeEmbeddings  # type: ignore
 except Exception:  # pragma: no cover
     try:
@@ -139,6 +144,9 @@ DEFAULT_SEARCH_TYPE = os.environ.get("SEARCH_TYPE", "mmr")  # mmr | similarity
 DEFAULT_MMR_LAMBDA = float(os.environ.get("MMR_LAMBDA", "0.3"))
 
 DEFAULT_MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "18000"))
+
+# Cross-encoder reranking. "none:" keeps retrieval exactly as it was.
+DEFAULT_RERANKER_ID = os.environ.get("RERANKER_ID", "none:")
 
 SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}
 
@@ -272,7 +280,8 @@ def make_embeddings(embedding_id: str):
       - tfidf:local               (always available fallback)
       - fake:anything             (if FakeEmbeddings exists)
       - hf:<huggingface model>    (requires langchain-huggingface)
-      - openai:<model> / gemini:<model> / ollama:<model> (if corresponding deps installed)
+      - ollama:<model>            (requires langchain-ollama and a running Ollama server)
+      - openai:<model> / gemini:<model> (if corresponding deps installed)
     """
     if ":" not in embedding_id:
         raise ValueError("embedding_id must have a prefix like 'tfidf:' or 'hf:'")
@@ -291,6 +300,11 @@ def make_embeddings(embedding_id: str):
         if HuggingFaceEmbeddings is None:
             raise RuntimeError("langchain-huggingface not installed.")
         return HuggingFaceEmbeddings(model_name=model)
+
+    if provider == "ollama":
+        if OllamaEmbeddings is None:
+            raise RuntimeError("langchain-ollama not installed.")
+        return OllamaEmbeddings(model=model)
 
     raise RuntimeError(f"Embedding provider '{provider}' not available in this runtime. Use 'tfidf:local' or install deps.")
 
@@ -463,7 +477,8 @@ def _hybrid_rerank(query: str, docs_and_scores: List[Tuple[Document, float]]) ->
     order = sorted(range(len(docs)), key=lambda i: blended[i], reverse=True)
     return [docs[i] for i in order]
 
-def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type: str, mmr_lambda: float) -> List[Document]:
+def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type: str, mmr_lambda: float,
+                  reranker_id: Optional[str] = None) -> List[Document]:
     variants = _build_query_variants(query)
     cand: List[Tuple[Document, float]] = []
     per_q = max(5, min(fetch_k, 40))
@@ -488,7 +503,14 @@ def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type:
             pass
 
     reranked = _hybrid_rerank(query, list(uniq.values()))
-    return reranked[:top_k]
+
+    # The hybrid blend picks the candidate pool; the cross-encoder, when
+    # enabled, reorders that pool and makes the final top_k cut.
+    from reranker import make_reranker, rerank
+    rr = make_reranker(reranker_id if reranker_id is not None else DEFAULT_RERANKER_ID)
+    if rr is None:
+        return reranked[:top_k]
+    return rerank(rr, query, reranked[:max(fetch_k, top_k)], top_k)
 
 def format_context(docs: List[Document], max_chars: int) -> Tuple[str, List[Dict[str, Any]]]:
     blocks: List[str] = []
@@ -543,6 +565,19 @@ def make_llm(llm_id: str):
             raise RuntimeError("langchain-openai not installed.")
         return ChatOpenAI(model=model, temperature=float(os.environ.get("OPENAI_TEMPERATURE","0.2")))
 
+    if provider == "lmstudio":
+        if ChatOpenAI is None:
+            raise RuntimeError("langchain-openai not installed.")
+        # LM Studio exposes an OpenAI-compatible server. The api_key is passed
+        # explicitly so a real OPENAI_API_KEY in the environment is never sent
+        # to the local server.
+        return ChatOpenAI(
+            model=model,
+            base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
+            api_key=os.environ.get("LMSTUDIO_API_KEY", "lm-studio"),
+            temperature=float(os.environ.get("LMSTUDIO_TEMPERATURE", "0.2")),
+        )
+
     if provider == "gemini":
         if ChatGoogleGenerativeAI is None:
             raise RuntimeError("langchain-google-genai not installed.")
@@ -581,8 +616,17 @@ def sources():
     version = request.args.get("version", DEFAULT_VERSION)
     store, _, cname, backend = get_store(embedding_id, version)
     if hasattr(store, "_collection"):
-        data = store._collection.get(include=["metadatas"], limit=100000)
-        srcs = sorted({(m or {}).get("source_path") for m in (data.get("metadatas") or []) if (m or {}).get("source_path")})
+        # Chroma's SQLite backend binds one variable per row, so a single large
+        # get() raises "too many SQL variables" past ~32k chunks. Page instead.
+        found = set()
+        offset, page = 0, 10000
+        while True:
+            metas = store._collection.get(include=["metadatas"], limit=page, offset=offset).get("metadatas") or []
+            found.update((m or {}).get("source_path") for m in metas if (m or {}).get("source_path"))
+            if len(metas) < page:
+                break
+            offset += page
+        srcs = sorted(found)
     else:
         # fallback store
         srcs = sorted({(d.metadata or {}).get("source_path") for d in getattr(store, "_docs", []) if (d.metadata or {}).get("source_path")})
@@ -708,6 +752,7 @@ def config():
         "embedding_id": DEFAULT_EMBEDDING_ID,
         "version": DEFAULT_VERSION,
         "llm_id": DEFAULT_LLM_ID,
+        "reranker_id": DEFAULT_RERANKER_ID,
         "watched_folder": WATCHED_FOLDER,
         "supported_extensions": sorted(SUPPORTED_EXTS),
     })
@@ -786,11 +831,13 @@ def retrieve():
     search_type = payload.get("search_type", DEFAULT_SEARCH_TYPE)
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
+    reranker_id = payload.get("reranker_id", DEFAULT_RERANKER_ID)
 
     store, _, cname, backend = get_store(embedding_id, version)
-    docs = retrieve_docs(store, query, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda)
+    docs = retrieve_docs(store, query, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda,
+                         reranker_id=reranker_id)
     context, sources = format_context(docs, max_chars)
-    return jsonify({"context":context,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version})
+    return jsonify({"context":context,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"reranker_id":reranker_id})
 
 
 MAX_HISTORY_MESSAGES = 100  # 50 user/assistant exchanges
@@ -868,13 +915,15 @@ def answer():
     search_type = payload.get("search_type", DEFAULT_SEARCH_TYPE)
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
+    reranker_id = payload.get("reranker_id", DEFAULT_RERANKER_ID)
 
     history = payload.get("history") or []
     if not isinstance(history, list):
         history = []
 
     store, _, cname, backend = get_store(embedding_id, version)
-    docs = retrieve_docs(store, question, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda)
+    docs = retrieve_docs(store, question, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda,
+                         reranker_id=reranker_id)
     context, sources = format_context(docs, max_chars)
 
     system_text = (
@@ -909,9 +958,22 @@ def answer():
     else:
         messages = _build_chat_messages(system_text, history, cacheable_prefix + user_text)
     resp = llm.invoke(messages)
-    answer_text = getattr(resp, "content", None) or str(resp)
+    content = getattr(resp, "content", None)
+    if content is None:
+        answer_text = str(resp)
+    elif str(content).strip():
+        answer_text = content
+    else:
+        # Reasoning models can spend their whole budget before emitting any
+        # content (common when a model is loaded with a small context window).
+        # Report that instead of dumping the raw response object.
+        usage = (getattr(resp, "response_metadata", None) or {}).get("token_usage", {})
+        answer_text = (
+            f"The model '{llm_id}' returned an empty answer, most likely hitting its token "
+            f"limit before producing content. token_usage: {usage}"
+        )
 
-    return jsonify({"answer":answer_text,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"llm_id":llm_id})
+    return jsonify({"answer":answer_text,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"llm_id":llm_id,"reranker_id":reranker_id})
 
 if __name__ == "__main__":
     os.makedirs(CHROMA_PATH, exist_ok=True)

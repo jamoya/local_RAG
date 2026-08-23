@@ -669,3 +669,80 @@ def test_launch_extract_answer_dict():
 
 def test_launch_extract_answer_str_payload():
     assert launch_mod.extract_answer("plain") == "plain"
+
+
+# ----------------------------
+# MODEL_CHOICES / backend agreement
+# ----------------------------
+
+def test_model_choices_use_providers_the_backend_supports():
+    """Every dropdown entry must name a provider make_llm actually dispatches on.
+
+    Asks the backend rather than restating its provider list, so a UI entry the
+    server would reject fails here. Construction errors (missing optional dep or
+    missing API key) are fine -- only 'unsupported provider' is a real mismatch.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+    import local_rag_api as api
+
+    # Sanity: the check below is only meaningful if a bogus provider does raise.
+    with pytest.raises(ValueError, match="Unsupported llm provider"):
+        api.make_llm("definitely_not_a_provider:x")
+
+    for choice in ga.MODEL_CHOICES:
+        provider, _, model = choice.partition(":")
+        assert model, f"{choice}: empty model"
+        try:
+            api.make_llm(choice)
+        except ValueError as exc:
+            assert "Unsupported llm provider" not in str(exc), f"{choice}: {exc}"
+        except Exception:
+            pass  # missing dependency or credentials -- not a UI/backend mismatch
+
+
+def test_build_request_body_includes_reranker_id():
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=False,
+        reranker_id="ce:BAAI/bge-reranker-v2-m3",
+    )
+    assert body["reranker_id"] == "ce:BAAI/bge-reranker-v2-m3"
+
+
+def test_build_request_body_omits_blank_reranker_id():
+    """A blank box means 'use the server default', so the key must not be sent."""
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=False, reranker_id="",
+    )
+    assert "reranker_id" not in body
+
+
+def test_launch_compatible_still_omits_reranker_id():
+    body = ga.build_request_body(
+        question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
+        top_k=6, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=18000, launch_compatible=True,
+        reranker_id="ce:BAAI/bge-reranker-v2-m3",
+    )
+    assert body == {"query": "q", "llm_id": "mock:any"}
+
+
+def test_ask_api_binds_reranker_id_before_history():
+    """The Ask tab passes Gradio inputs positionally.
+
+    reranker_id must sit immediately after launch_compatible, otherwise the
+    textbox value would silently land in `history`.
+    """
+    import inspect
+
+    params = list(inspect.signature(ga.ask_api).parameters)
+    assert params.index("reranker_id") == params.index("launch_compatible") + 1
+    assert params.index("history") > params.index("reranker_id")
+
+
+def test_model_choices_include_local_generators():
+    assert "ollama:qwen3:30b" in ga.MODEL_CHOICES
+    assert "lmstudio:google/gemma-4-12b-qat" in ga.MODEL_CHOICES
