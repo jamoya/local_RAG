@@ -818,30 +818,32 @@ def config():
     })
 
 
-@app.post("/ingest_folder")
-def ingest_folder():
-    """Scan a folder and ingest new/changed files. Uses the folder_watcher fingerprint+state."""
+def sync_folder(folder: str, embedding_id: str, version: str,
+                extensions: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Reconcile one folder against the store: ingest what is missing or changed,
+    delete vectors for files that are gone.
+
+    Three inputs: the disk, the store, and the watcher's fingerprint state file.
+    The store is what decides whether a file is ingested at all -- a stale state
+    file beside an emptied collection must not make a sync a no-op.
+    """
     from folder_watcher import (
         scan_disk, state_file_path, load_state, save_state, file_fingerprint,
     )
 
-    payload = request.get_json(silent=True) or {}
-    folder = payload.get("folder") or WATCHED_FOLDER
-    embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
-    version = payload.get("version", DEFAULT_VERSION)
-    extensions = payload.get("extensions") or sorted(SUPPORTED_EXTS)
-
     folder_path = Path(folder).expanduser().resolve()
-    if not folder_path.is_dir():
-        return jsonify({"error": f"folder not found or not a directory: {folder}"}), 400
+    exts = extensions or sorted(SUPPORTED_EXTS)
 
     state_path = state_file_path(folder_path, version, embedding_id)
     state = load_state(state_path)
     files_state = state.setdefault("files", {})
 
-    disk = scan_disk(folder_path, extensions, recursive=False)
+    disk = scan_disk(folder_path, exts, recursive=False)
+    store, _, _, _ = get_store(embedding_id, version)
+    indexed = set(_sources_in(store, str(folder_path)))
 
     ingested: List[Dict[str, Any]] = []
+    deleted: List[str] = []
     skipped_unchanged = 0
     errors: List[Dict[str, str]] = []
 
@@ -852,7 +854,8 @@ def ingest_folder():
         except FileNotFoundError:
             continue
         prev = files_state.get(path_str)
-        if prev and prev.get("mtime") == fp["mtime"] and prev.get("size") == fp["size"]:
+        unchanged = prev and prev.get("mtime") == fp["mtime"] and prev.get("size") == fp["size"]
+        if unchanged and path_str in indexed:
             skipped_unchanged += 1
             continue
         try:
@@ -864,18 +867,46 @@ def ingest_folder():
         except Exception as e:
             errors.append({"source_path": path_str, "error": f"{type(e).__name__}: {e}"})
 
+    for path_str in sorted(indexed - disk):
+        delete_by_source(store, path_str)
+        files_state.pop(path_str, None)
+        deleted.append(path_str)
+        print(f"file {Path(path_str).name} removed from the database")
+    if deleted:
+        save_state(state_path, state)
+
+    return {
+        "folder": str(folder_path),
+        "scanned": len(disk),
+        "ingested": ingested,
+        "deleted": deleted,
+        "skipped_unchanged": skipped_unchanged,
+        "errors": errors,
+    }
+
+
+@app.post("/ingest_folder")
+def ingest_folder():
+    """Scan a folder and reconcile it with the store: ingest new/changed, delete removed."""
+    payload = request.get_json(silent=True) or {}
+    folder = payload.get("folder") or folder_registry.active_folder(CHROMA_PATH, WATCHED_FOLDER)
+    embedding_id = payload.get("embedding_id", DEFAULT_EMBEDDING_ID)
+    version = payload.get("version", DEFAULT_VERSION)
+    extensions = payload.get("extensions") or sorted(SUPPORTED_EXTS)
+
+    folder_path = Path(folder).expanduser().resolve()
+    if not folder_path.is_dir():
+        return jsonify({"error": f"folder not found or not a directory: {folder}"}), 400
+
+    res = sync_folder(str(folder_path), embedding_id, version, extensions)
     _, _, cname, backend = get_store(embedding_id, version)
     return jsonify({
         "status": "ok",
-        "folder": str(folder_path),
         "embedding_id": embedding_id,
         "version": version,
         "collection": cname,
         "backend": backend,
-        "scanned": len(disk),
-        "ingested": ingested,
-        "skipped_unchanged": skipped_unchanged,
-        "errors": errors,
+        **res,
     })
 
 @app.post("/retrieve")

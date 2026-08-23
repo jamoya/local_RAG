@@ -578,3 +578,102 @@ def test_tfidf_fallback_store_honours_filter(tmp_path):
 
     mmr = store.max_marginal_relevance_search("dust limit", k=5, fetch_k=5, lambda_mult=0.3, filter={"folder": "/beta"})
     assert [d.metadata["source_path"] for d in mmr] == ["/beta/b.txt"]
+
+
+# ----------------------------
+# sync_folder: three-way reconciliation
+# ----------------------------
+
+def test_sync_ingests_when_state_file_lies_about_an_empty_store(tmp_path):
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+    from folder_watcher import state_file_path, save_state, file_fingerprint
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    f = folder / "a.txt"
+    f.write_text("dust limit is 5 mg per normal cubic metre")
+
+    # A stale state file: fingerprints recorded, but nothing was ever stored.
+    sp = state_file_path(folder, "vtest", "fake:any")
+    save_state(sp, {"files": {str(f.resolve()): file_fingerprint(f)}})
+
+    res = mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    assert [i["source_path"] for i in res["ingested"]] == [str(f.resolve())]
+    assert res["skipped_unchanged"] == 0
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    assert mod._sources_in(store, str(folder.resolve())) == [str(f.resolve())]
+
+
+def test_sync_skips_unchanged_on_second_run(tmp_path):
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.txt").write_text("dust limit is 5 mg per normal cubic metre")
+
+    first = mod.sync_folder(str(folder), "fake:any", "vtest")
+    second = mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    assert len(first["ingested"]) == 1
+    assert second["ingested"] == []
+    assert second["skipped_unchanged"] == 1
+
+
+def test_sync_deletes_vectors_for_files_removed_from_disk(tmp_path):
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    keep = folder / "keep.txt"
+    gone = folder / "gone.txt"
+    keep.write_text("keep this content about dust")
+    gone.write_text("delete this content about dust")
+    mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    gone.unlink()
+    res = mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    assert res["deleted"] == [str(gone.resolve())]
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    assert mod._sources_in(store, str(folder.resolve())) == [str(keep.resolve())]
+
+
+def test_sync_never_touches_another_folders_documents(tmp_path):
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    alpha = tmp_path / "alpha"
+    beta = tmp_path / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    (alpha / "a.txt").write_text("alpha content about dust")
+    (beta / "b.txt").write_text("beta content about dust")
+    mod.sync_folder(str(alpha), "fake:any", "vtest")
+    mod.sync_folder(str(beta), "fake:any", "vtest")
+
+    # Empty alpha entirely, then sync it. Beta must survive untouched.
+    (alpha / "a.txt").unlink()
+    res = mod.sync_folder(str(alpha), "fake:any", "vtest")
+
+    assert res["deleted"] == [str((alpha / "a.txt").resolve())]
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    assert mod._sources_in(store, str(beta.resolve())) == [str((beta / "b.txt").resolve())]
+
+
+def test_ingest_folder_route_reports_deletions(client, tmp_path):
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    doomed = folder / "doomed.txt"
+    doomed.write_text("content about dust that will be removed")
+
+    r = client.post("/ingest_folder", json={"folder": str(folder), "embedding_id": "fake:any", "version": "vtest"})
+    assert r.status_code == 200, r.data
+    assert len(r.get_json()["ingested"]) == 1
+
+    doomed.unlink()
+    r = client.post("/ingest_folder", json={"folder": str(folder), "embedding_id": "fake:any", "version": "vtest"})
+    assert r.get_json()["deleted"] == [str(doomed.resolve())]
