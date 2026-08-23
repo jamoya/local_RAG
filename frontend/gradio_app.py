@@ -461,6 +461,7 @@ def fetch_sources(
     embedding_id: str,
     version: str,
     timeout_s: int = 30,
+    folder: str = "",
 ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
     """Call GET /sources and return (annotated_sources, collection, error)."""
     api_base = (api_base or "").strip().rstrip("/")
@@ -470,6 +471,7 @@ def fetch_sources(
         params = {
             "embedding_id": (embedding_id or "").strip(),
             "version": (version or "").strip(),
+            "folder": (folder or "").strip(),
         }
         params = {k: v for k, v in params.items() if v}
         r = requests.get(f"{api_base}/sources", params=params, timeout=timeout_s)
@@ -481,14 +483,89 @@ def fetch_sources(
     return annotate_sources(paths), (data.get("collection") if isinstance(data, dict) else None), None
 
 
+def fetch_folders(
+    api_base: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int = 30,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Call GET /folders and return (payload, error)."""
+    api_base = (api_base or "").strip().rstrip("/")
+    if not api_base:
+        return {}, "API base URL is empty."
+    params = {"embedding_id": (embedding_id or "").strip(), "version": (version or "").strip()}
+    params = {k: v for k, v in params.items() if v}
+    try:
+        r = requests.get(f"{api_base}/folders", params=params, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {}, f"{type(e).__name__}: {e}"
+    return (data if isinstance(data, dict) else {}), None
+
+
+def render_folders_html(payload: Dict[str, Any]) -> str:
+    """Folder list with per-folder document counts, active one marked."""
+    folders = payload.get("folders") or []
+    active = payload.get("active") or ""
+    chroma_path = payload.get("chroma_path") or ""
+    if not folders:
+        return '<div class="nb-empty">No folders indexed yet.</div>'
+
+    bits = [f'<div class="nb-counts">store: {html.escape(chroma_path)}</div>',
+            '<div class="nb-sources-wrap">']
+    for f in folders:
+        path = f.get("path") or ""
+        count = int(f.get("file_count") or 0)
+        is_active = path == active
+        dot = "nb-status-ok" if f.get("exists") else "nb-status-missing"
+        mark = '<span class="nb-status-pill ok">ACTIVE</span>' if is_active else ""
+        bits.append(
+            '<div class="nb-source">'
+            '  <div class="nb-source-body">'
+            f'    <div class="nb-source-name">{html.escape(path)}</div>'
+            f'    <div class="nb-counts">{count} files {mark}</div>'
+            '  </div>'
+            f'  <div class="nb-status-dot {dot}"></div>'
+            '</div>'
+        )
+    bits.append("</div>")
+    return "\n".join(bits)
+
+
+def switch_watched_folder(
+    api_base: str,
+    folder: str,
+    embedding_id: str,
+    version: str,
+    timeout_s: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call POST /watched_folder. Returns (summary, error)."""
+    api_base = (api_base or "").strip().rstrip("/")
+    if not api_base:
+        return None, "API base URL is empty."
+    body = {"folder": (folder or "").strip(),
+            "embedding_id": (embedding_id or "").strip(),
+            "version": (version or "").strip()}
+    body = {k: v for k, v in body.items() if v}
+    try:
+        r = requests.post(f"{api_base}/watched_folder", json=body, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    return (data if isinstance(data, dict) else {}), None
+
+
 def refresh_sources_panel(
     api_base: str,
     embedding_id: str,
     version: str,
     timeout_s: int,
+    folder: str = "",
 ) -> Tuple[str, str]:
     """Returns (panel_html, status_pill_html)."""
-    sources, collection, err = fetch_sources(api_base, embedding_id, version, timeout_s)
+    sources, collection, err = fetch_sources(api_base, embedding_id, version, timeout_s, folder=folder)
     if err is not None:
         return (
             f'<div class="nb-empty">Could not reach API: {html.escape(err)}</div>',
@@ -553,8 +630,10 @@ def _format_ingest_banner(summary: Optional[Dict[str, Any]], err: Optional[str])
     errors = summary.get("errors") or []
     total_chunks = sum(int(item.get("chunks") or 0) for item in ingested)
     plural = "s" if len(ingested) != 1 else ""
+    deleted = summary.get("deleted") or []
     base = html.escape(
-        f"Ingested {len(ingested)} new file{plural} · {total_chunks} chunks · {skipped} unchanged skipped"
+        f"Ingested {len(ingested)} new file{plural} · {total_chunks} chunks · "
+        f"{len(deleted)} removed · {skipped} unchanged skipped"
     )
     if errors:
         base += f' · <span style="color:var(--nb-danger)">{len(errors)} error(s)</span>'
@@ -566,23 +645,25 @@ def refresh_panel_with_ingest(
     embedding_id: str,
     version: str,
     timeout_s: int,
+    folder: str = "",
     ingest_timeout_s: Optional[int] = None,
 ) -> Tuple[str, str]:
-    """Trigger a folder ingest (watched_folder) then re-list /sources.
+    """Reconcile the active folder then re-list /sources for it.
 
     ``timeout_s`` is used for the short /sources call. ``ingest_timeout_s``
     governs /ingest_folder, which may take minutes on large PDFs with real
     embedding models; it defaults to DEFAULT_INGEST_TIMEOUT_S.
     """
     ingest_to = int(ingest_timeout_s) if ingest_timeout_s else DEFAULT_INGEST_TIMEOUT_S
+    target = (folder or "").strip() or DEFAULT_WATCHED_FOLDER
     summary, err = trigger_folder_ingest(
         api_base=api_base,
-        folder=DEFAULT_WATCHED_FOLDER,
+        folder=target,
         embedding_id=embedding_id,
         version=version,
         timeout_s=ingest_to,
     )
-    panel_html, pill = refresh_sources_panel(api_base, embedding_id, version, timeout_s)
+    panel_html, pill = refresh_sources_panel(api_base, embedding_id, version, timeout_s, folder=target)
     banner = _format_ingest_banner(summary, err)
     return (banner + panel_html) if banner else panel_html, pill
 
@@ -814,6 +895,9 @@ def build_ui() -> gr.Blocks:
     initial_version = srv.get("version") or DEFAULT_VERSION
     initial_reranker_id = srv.get("reranker_id") or DEFAULT_RERANKER_ID
     initial_preset = context_preset(DEFAULT_LLM_ID)
+    initial_active = srv.get("active_folder") or DEFAULT_WATCHED_FOLDER
+    _folders_payload, _ = fetch_folders(DEFAULT_API_BASE, initial_embedding_id, initial_version)
+    initial_folders = [f["path"] for f in (_folders_payload.get("folders") or [])] or [initial_active]
 
     with gr.Blocks(title="Local RAG") as demo:
         with gr.Row(elem_classes=["nb-header"]):
@@ -827,6 +911,17 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             # ---- Sources panel ----
             with gr.Column(scale=3, min_width=280):
+                with gr.Group(elem_classes=["nb-side"]):
+                    gr.HTML('<div class="nb-section-title">Folders</div>')
+                    folder_choice = gr.Dropdown(
+                        label="Active folder",
+                        choices=initial_folders,
+                        value=initial_active,
+                        allow_custom_value=True,
+                        interactive=True,
+                    )
+                    use_folder_btn = gr.Button("Use this folder", variant="primary", size="sm")
+                    folders_html = gr.HTML('<div class="nb-empty">Loading…</div>')
                 with gr.Group(elem_classes=["nb-side"]):
                     with gr.Row():
                         gr.HTML('<div class="nb-section-title">Sources</div>')
@@ -1087,18 +1182,52 @@ def build_ui() -> gr.Blocks:
                         )
                         clear_cmp_btn.click(fn=lambda: "", inputs=[], outputs=[cmp_question])
 
-        # Wire up the Sources panel:
-        # - refresh_btn: ingest any new files in watched_folder/ then re-list /sources.
-        # - initial load: just list /sources (no implicit ingest).
+        # Wire up the Folders and Sources panels:
+        # - use_folder_btn: switch the active folder, reconcile it, refresh both panels.
+        # - refresh_btn: reconcile the active folder then re-list its /sources.
+        # - initial load: list both panels for the active folder (no implicit ingest).
+        def on_use_folder(api_base_v, folder_v, embedding_id_v, version_v, timeout_v):
+            summary, err = switch_watched_folder(
+                api_base_v, folder_v, embedding_id_v, version_v, DEFAULT_INGEST_TIMEOUT_S,
+            )
+            payload, _ = fetch_folders(api_base_v, embedding_id_v, version_v, timeout_v)
+            active = (summary or {}).get("active_folder") or folder_v
+            panel_html, pill = refresh_sources_panel(
+                api_base_v, embedding_id_v, version_v, timeout_v, folder=active,
+            )
+            banner = _format_ingest_banner(summary, err)
+            return (
+                render_folders_html(payload),
+                (banner + panel_html) if banner else panel_html,
+                pill,
+                gr.update(choices=[f["path"] for f in (payload.get("folders") or [])], value=active),
+            )
+
+        use_folder_btn.click(
+            fn=on_use_folder,
+            inputs=[api_base, folder_choice, embedding_id, version, timeout_s],
+            outputs=[folders_html, sources_html, status_pill, folder_choice],
+        )
+
         refresh_btn.click(
             fn=refresh_panel_with_ingest,
-            inputs=[api_base, embedding_id, version, timeout_s],
+            inputs=[api_base, embedding_id, version, timeout_s, folder_choice],
             outputs=[sources_html, status_pill],
         )
+
+        def on_load(api_base_v, embedding_id_v, version_v, timeout_v, folder_v):
+            payload, _ = fetch_folders(api_base_v, embedding_id_v, version_v, timeout_v)
+            active = payload.get("active") or folder_v
+            panel_html, pill = refresh_sources_panel(
+                api_base_v, embedding_id_v, version_v, timeout_v, folder=active,
+            )
+            choices = [f["path"] for f in (payload.get("folders") or [])] or [active]
+            return render_folders_html(payload), panel_html, pill, gr.update(choices=choices, value=active)
+
         demo.load(
-            fn=refresh_sources_panel,
-            inputs=[api_base, embedding_id, version, timeout_s],
-            outputs=[sources_html, status_pill],
+            fn=on_load,
+            inputs=[api_base, embedding_id, version, timeout_s, folder_choice],
+            outputs=[folders_html, sources_html, status_pill, folder_choice],
         )
 
     return demo

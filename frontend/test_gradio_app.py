@@ -347,6 +347,32 @@ def test_refresh_panel_with_ingest_accepts_explicit_ingest_timeout(tmp_path):
     assert mp.call_args.kwargs["timeout"] == 2400
 
 
+def test_refresh_panel_with_ingest_targets_the_selected_folder(tmp_path):
+    """Refresh must reconcile the folder the user picked, not the startup default."""
+    ingest_payload = {"status": "ok", "scanned": 0, "ingested": [], "deleted": [],
+                      "skipped_unchanged": 0, "errors": []}
+    sources_payload = {"sources": [], "collection": "kb"}
+    with patch("gradio_app.requests.post", return_value=_FakeResponse(200, ingest_payload)) as mp, \
+         patch("gradio_app.requests.get", return_value=_FakeResponse(200, sources_payload)) as mg:
+        ga.refresh_panel_with_ingest(
+            "http://api", "fake:any", "v1", 5, folder="/data/alpha",
+        )
+
+    assert mp.call_args.kwargs["json"]["folder"] == "/data/alpha"
+    assert mg.call_args.kwargs["params"]["folder"] == "/data/alpha"
+
+
+def test_refresh_panel_with_ingest_falls_back_to_the_default_folder(tmp_path):
+    ingest_payload = {"status": "ok", "scanned": 0, "ingested": [], "deleted": [],
+                      "skipped_unchanged": 0, "errors": []}
+    sources_payload = {"sources": [], "collection": "kb"}
+    with patch("gradio_app.requests.post", return_value=_FakeResponse(200, ingest_payload)) as mp, \
+         patch("gradio_app.requests.get", return_value=_FakeResponse(200, sources_payload)):
+        ga.refresh_panel_with_ingest("http://api", "fake:any", "v1", 5, folder="")
+
+    assert mp.call_args.kwargs["json"]["folder"] == ga.DEFAULT_WATCHED_FOLDER
+
+
 def test_refresh_panel_with_ingest_still_lists_when_ingest_fails(tmp_path):
     real = tmp_path / "existing.txt"; real.write_text("hi")
     sources_payload = {"sources": [str(real)], "collection": "kb"}
@@ -358,6 +384,97 @@ def test_refresh_panel_with_ingest_still_lists_when_ingest_fails(tmp_path):
     assert "Ingest failed" in html_panel
     assert "existing.txt" in html_panel
     assert "connected" in pill
+
+
+# ----------------------------
+# folders panel: fetch_folders / render_folders_html / switch_watched_folder
+# ----------------------------
+
+def test_render_folders_html_marks_the_active_one():
+    html_out = ga.render_folders_html({
+        "active": "/data/alpha",
+        "chroma_path": "/db",
+        "folders": [
+            {"path": "/data/alpha", "exists": True, "file_count": 2},
+            {"path": "/data/beta", "exists": False, "file_count": 7},
+        ],
+    })
+    assert "/data/alpha" in html_out
+    assert "ACTIVE" in html_out
+    assert "2 files" in html_out
+    assert "7 files" in html_out
+    assert "/db" in html_out
+
+
+def test_fetch_sources_forwards_the_folder_param():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"sources": [], "collection": "c"}
+
+    def _get(url, params=None, timeout=None):
+        captured["params"] = params
+        return _Resp()
+
+    with patch("requests.get", _get):
+        ga.fetch_sources("http://x", "fake:any", "v1", 5, folder="/data/alpha")
+    assert captured["params"]["folder"] == "/data/alpha"
+
+
+def test_switch_watched_folder_posts_the_path():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"status": "ok", "active_folder": "/data/alpha", "ingested": [], "deleted": []}
+
+    def _post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _Resp()
+
+    with patch("requests.post", _post):
+        summary, err = ga.switch_watched_folder("http://x", "/data/alpha", "fake:any", "v1", 60)
+
+    assert err is None
+    assert captured["url"] == "http://x/watched_folder"
+    assert captured["json"]["folder"] == "/data/alpha"
+    assert summary["active_folder"] == "/data/alpha"
+
+
+def test_switch_watched_folder_reports_a_rejected_path():
+    class _Resp:
+        status_code = 400
+
+        def raise_for_status(self):
+            raise ValueError("400 Client Error")
+
+        def json(self):
+            return {"error": "not a directory"}
+
+    with patch("requests.post", lambda *a, **k: _Resp()):
+        summary, err = ga.switch_watched_folder("http://x", "/nope", "fake:any", "v1", 60)
+
+    assert summary is None
+    assert "ValueError" in err
+
+
+def test_ingest_banner_reports_deletions():
+    out = ga._format_ingest_banner({"ingested": [{"chunks": 3}], "deleted": ["/a.txt"], "skipped_unchanged": 2}, None)
+    assert "1 new file" in out
+    assert "1 removed" in out
+    assert "2 unchanged" in out
 
 
 # ----------------------------
