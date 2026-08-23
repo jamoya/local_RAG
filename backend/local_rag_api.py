@@ -818,6 +818,37 @@ def config():
     })
 
 
+@app.get("/folders")
+def folders():
+    """Folders that have documents in the active collection, plus every known folder.
+
+    Counts are per collection: the same folder may hold documents under several
+    embedding models, and mixing counts across collections would mislead.
+    """
+    embedding_id = request.args.get("embedding_id", DEFAULT_EMBEDDING_ID)
+    version = request.args.get("version", DEFAULT_VERSION)
+    store, _, cname, _ = get_store(embedding_id, version)
+
+    counts: Dict[str, int] = {}
+    for src in _sources_in(store):
+        counts[_folder_of(src)] = counts.get(_folder_of(src), 0) + 1
+
+    active = folder_registry.active_folder(CHROMA_PATH, WATCHED_FOLDER)
+    paths = set(counts) | set(folder_registry.known_folders(CHROMA_PATH, WATCHED_FOLDER)) | {active}
+
+    return jsonify({
+        "active": active,
+        "chroma_path": CHROMA_PATH,
+        "collection": cname,
+        "embedding_id": embedding_id,
+        "version": version,
+        "folders": [
+            {"path": p, "exists": Path(p).is_dir(), "file_count": counts.get(p, 0)}
+            for p in sorted(paths)
+        ],
+    })
+
+
 def sync_folder(folder: str, embedding_id: str, version: str,
                 extensions: Optional[List[str]] = None) -> Dict[str, Any]:
     """Reconcile one folder against the store: ingest what is missing or changed,

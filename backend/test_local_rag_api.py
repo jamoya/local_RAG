@@ -677,3 +677,38 @@ def test_ingest_folder_route_reports_deletions(client, tmp_path):
     doomed.unlink()
     r = client.post("/ingest_folder", json={"folder": str(folder), "embedding_id": "fake:any", "version": "vtest"})
     assert r.get_json()["deleted"] == [str(doomed.resolve())]
+
+
+# ----------------------------
+# /folders
+# ----------------------------
+
+def test_folders_lists_counts_and_marks_active(client, tmp_path):
+    import local_rag_api as mod
+    import folder_registry as fr
+
+    alpha = tmp_path / "alpha"
+    _ingest_text(client, alpha / "a.txt", "alpha content about dust limits")
+    _ingest_text(client, alpha / "a2.txt", "more alpha content about dust limits")
+    _ingest_text(client, tmp_path / "beta" / "b.txt", "beta content about dust limits")
+    fr.set_active(mod.CHROMA_PATH, str(alpha))
+
+    js = client.get("/folders?embedding_id=fake:any&version=vtest").get_json()
+    assert js["active"] == str(alpha.resolve())
+    by_path = {f["path"]: f for f in js["folders"]}
+    assert by_path[str(alpha.resolve())]["file_count"] == 2
+    assert by_path[str((tmp_path / "beta").resolve())]["file_count"] == 1
+    assert by_path[str(alpha.resolve())]["exists"] is True
+
+
+def test_folders_includes_a_known_folder_with_no_documents(client, tmp_path):
+    import local_rag_api as mod
+    import folder_registry as fr
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    fr.set_active(mod.CHROMA_PATH, str(empty))
+
+    js = client.get("/folders?embedding_id=fake:any&version=vtest").get_json()
+    by_path = {f["path"]: f for f in js["folders"]}
+    assert by_path[str(empty.resolve())]["file_count"] == 0
