@@ -495,3 +495,67 @@ def test_backfill_is_idempotent(tmp_path):
     )
     assert mod._backfill_folder_metadata(store, cname) == 1
     assert mod._backfill_folder_metadata(store, cname) == 0
+
+
+def _ingest_text(client, path: Path, body: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    r = client.post(
+        "/ingest",
+        data={
+            "embedding_id": "fake:any",
+            "version": "vtest",
+            "source_path": str(path),
+            "file": (io.BytesIO(body.encode("utf-8")), path.name),
+        },
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 200, r.data
+
+
+def test_retrieve_folder_filter_excludes_other_folders(client, tmp_path):
+    a = tmp_path / "alpha" / "a.txt"
+    b = tmp_path / "beta" / "b.txt"
+    _ingest_text(client, a, "The alpha limit for dust is 5 mg per normal cubic metre.")
+    _ingest_text(client, b, "The beta limit for dust is 9 mg per normal cubic metre.")
+
+    r = client.post("/retrieve", json={
+        "query": "limit for dust",
+        "embedding_id": "fake:any",
+        "version": "vtest",
+        "folder": str((tmp_path / "alpha").resolve()),
+    })
+    assert r.status_code == 200, r.data
+    names = {s["source_path"] for s in r.get_json()["sources"]}
+    assert names == {str(a.resolve())}
+
+
+def test_retrieve_without_folder_spans_all_folders(client, tmp_path):
+    a = tmp_path / "alpha" / "a.txt"
+    b = tmp_path / "beta" / "b.txt"
+    _ingest_text(client, a, "The alpha limit for dust is 5 mg per normal cubic metre.")
+    _ingest_text(client, b, "The beta limit for dust is 9 mg per normal cubic metre.")
+
+    r = client.post("/retrieve", json={
+        "query": "limit for dust", "embedding_id": "fake:any", "version": "vtest",
+    })
+    names = {s["source_path"] for s in r.get_json()["sources"]}
+    assert names == {str(a.resolve()), str(b.resolve())}
+
+
+def test_tfidf_fallback_store_honours_filter(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+    from langchain_core.documents import Document
+
+    store = mod._TfidfStore()
+    store.add_documents([
+        Document(page_content="alpha dust limit", metadata={"folder": "/alpha", "source_path": "/alpha/a.txt"}),
+        Document(page_content="beta dust limit", metadata={"folder": "/beta", "source_path": "/beta/b.txt"}),
+    ])
+
+    hits = store.similarity_search("dust limit", k=5, filter={"folder": "/alpha"})
+    assert [d.metadata["source_path"] for d in hits] == ["/alpha/a.txt"]
+
+    mmr = store.max_marginal_relevance_search("dust limit", k=5, fetch_k=5, lambda_mult=0.3, filter={"folder": "/beta"})
+    assert [d.metadata["source_path"] for d in mmr] == ["/beta/b.txt"]

@@ -312,6 +312,12 @@ def make_embeddings(embedding_id: str):
 
     raise RuntimeError(f"Embedding provider '{provider}' not available in this runtime. Use 'tfidf:local' or install deps.")
 
+def _md_matches(md: Optional[Dict[str, Any]], flt: Optional[Dict[str, Any]]) -> bool:
+    if not flt:
+        return True
+    md = md or {}
+    return all(md.get(k) == v for k, v in flt.items())
+
 class _TfidfStore:
     """Lightweight in-memory store used as a fallback when Chroma/LangChain aren't installed."""
     def __init__(self):
@@ -331,25 +337,26 @@ class _TfidfStore:
         self._docs = [d for d in self._docs if (d.metadata or {}).get("source_path") != source_path]
         self._refit()
 
-    def similarity_search_with_score(self, query: str, k: int) -> List[Tuple[Document, float]]:
+    def similarity_search_with_score(self, query: str, k: int, filter: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
         if not self._docs or self._X is None:
             return []
         qv = self._vectorizer.transform([query])
         sims = cosine_similarity(qv, self._X).ravel()
-        idx = sims.argsort()[::-1][:k]
-        # score as 1 - sim distance-like to keep downstream robust
-        return [(self._docs[i], float(1.0 - sims[i])) for i in idx]
+        allowed = [i for i, d in enumerate(self._docs) if _md_matches(d.metadata, filter)]
+        allowed.sort(key=lambda i: sims[i], reverse=True)
+        return [(self._docs[i], float(1.0 - sims[i])) for i in allowed[:k]]
 
-    def similarity_search(self, query: str, k: int) -> List[Document]:
-        return [d for d, _ in self.similarity_search_with_score(query, k)]
+    def similarity_search(self, query: str, k: int, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
+        return [d for d, _ in self.similarity_search_with_score(query, k, filter)]
 
-    def max_marginal_relevance_search(self, query: str, k: int, fetch_k: int, lambda_mult: float) -> List[Document]:
+    def max_marginal_relevance_search(self, query: str, k: int, fetch_k: int, lambda_mult: float, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
         # Simple MMR over cosine sims in TF-IDF space
         if not self._docs or self._X is None:
             return []
         qv = self._vectorizer.transform([query])
         sims = cosine_similarity(qv, self._X).ravel()
-        candidates = sims.argsort()[::-1][:fetch_k].tolist()
+        allowed = [i for i, d in enumerate(self._docs) if _md_matches(d.metadata, filter)]
+        candidates = sorted(allowed, key=lambda i: sims[i], reverse=True)[:fetch_k]
         selected: List[int] = []
         cand_vecs = self._X[candidates]
 
@@ -485,14 +492,14 @@ def _build_query_variants(query: str) -> List[str]:
             seen.add(v2)
     return out
 
-def _vector_candidates(store: Any, query: str, k: int) -> List[Tuple[Document, float]]:
+def _vector_candidates(store: Any, query: str, k: int, flt: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
     if hasattr(store, "similarity_search_with_score"):
         try:
-            return store.similarity_search_with_score(query, k=k)
+            return store.similarity_search_with_score(query, k=k, filter=flt)
         except Exception:
             pass
     if hasattr(store, "similarity_search"):
-        docs = store.similarity_search(query, k=k)
+        docs = store.similarity_search(query, k=k, filter=flt)
         return [(d, 1.0) for d in docs]
     raise RuntimeError("Store does not support retrieval")
 
@@ -518,12 +525,13 @@ def _hybrid_rerank(query: str, docs_and_scores: List[Tuple[Document, float]]) ->
     return [docs[i] for i in order]
 
 def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type: str, mmr_lambda: float,
-                  reranker_id: Optional[str] = None) -> List[Document]:
+                  reranker_id: Optional[str] = None, folder: Optional[str] = None) -> List[Document]:
+    flt = {"folder": folder} if folder else None
     variants = _build_query_variants(query)
     cand: List[Tuple[Document, float]] = []
     per_q = max(5, min(fetch_k, 40))
     for v in variants[:4]:
-        cand.extend(_vector_candidates(store, v, k=per_q))
+        cand.extend(_vector_candidates(store, v, k=per_q, flt=flt))
 
     uniq: Dict[str, Tuple[Document, float]] = {}
     for d, s in cand:
@@ -534,7 +542,7 @@ def retrieve_docs(store: Any, query: str, top_k: int, fetch_k: int, search_type:
 
     if search_type == "mmr" and hasattr(store, "max_marginal_relevance_search"):
         try:
-            mmr_docs = store.max_marginal_relevance_search(query, k=top_k, fetch_k=max(fetch_k, top_k*4), lambda_mult=mmr_lambda)
+            mmr_docs = store.max_marginal_relevance_search(query, k=top_k, fetch_k=max(fetch_k, top_k*4), lambda_mult=mmr_lambda, filter=flt)
             for d in mmr_docs:
                 md = d.metadata or {}
                 key = md.get("id") or f"{md.get('source_path')}|{md.get('page')}|{md.get('chunk')}|{hash(d.page_content)}"
@@ -874,10 +882,11 @@ def retrieve():
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
     reranker_id = payload.get("reranker_id", DEFAULT_RERANKER_ID)
+    folder = payload.get("folder") or None
 
     store, _, cname, backend = get_store(embedding_id, version)
     docs = retrieve_docs(store, query, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda,
-                         reranker_id=reranker_id)
+                         reranker_id=reranker_id, folder=folder)
     context, sources = format_context(docs, max_chars)
     return jsonify({"context":context,"sources":sources,"collection":cname,"backend":backend,"embedding_id":embedding_id,"version":version,"reranker_id":reranker_id})
 
@@ -985,6 +994,7 @@ def answer():
     mmr_lambda = float(payload.get("mmr_lambda", DEFAULT_MMR_LAMBDA))
     max_chars = int(payload.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS))
     reranker_id = payload.get("reranker_id", DEFAULT_RERANKER_ID)
+    folder = payload.get("folder") or None
 
     history = payload.get("history") or []
     if not isinstance(history, list):
@@ -993,7 +1003,7 @@ def answer():
     store, _, cname, backend = get_store(embedding_id, version)
     docs = retrieve_docs(store, _retrieval_query(question, history), top_k=top_k, fetch_k=fetch_k,
                          search_type=search_type, mmr_lambda=mmr_lambda,
-                         reranker_id=reranker_id)
+                         reranker_id=reranker_id, folder=folder)
     context, sources = format_context(docs, max_chars)
 
     system_text = (
