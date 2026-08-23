@@ -392,6 +392,11 @@ def test_config_exposes_reranker_id(client):
     assert client.get("/config").get_json()["reranker_id"] == "none:"
 
 
+def test_config_reports_active_folder(client, tmp_path):
+    js = client.get("/config").get_json()
+    assert js["active_folder"] == js["watched_folder"]
+
+
 def test_make_llm_lmstudio_targets_local_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key-must-not-leak")
     app = _make_app(tmp_path)  # noqa: F841

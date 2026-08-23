@@ -119,6 +119,8 @@ except Exception:  # pragma: no cover
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+import folder_registry
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -811,6 +813,7 @@ def config():
         "llm_id": DEFAULT_LLM_ID,
         "reranker_id": DEFAULT_RERANKER_ID,
         "watched_folder": WATCHED_FOLDER,
+        "active_folder": folder_registry.active_folder(CHROMA_PATH, WATCHED_FOLDER),
         "supported_extensions": sorted(SUPPORTED_EXTS),
     })
 
