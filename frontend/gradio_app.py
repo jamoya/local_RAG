@@ -27,7 +27,7 @@ DEFAULT_ENDPOINT = os.environ.get("RAG_ENDPOINT", "answer")
 DEFAULT_EMBEDDING_ID = os.environ.get("EMBEDDING_ID", "tfidf:local")
 DEFAULT_RERANKER_ID = os.environ.get("RERANKER_ID", "none:")
 DEFAULT_VERSION = os.environ.get("CHROMA_COLLECTION_VERSION", "v1")
-DEFAULT_LLM_ID = os.environ.get("LLM_ID", "openai:gpt-4o-mini")
+DEFAULT_LLM_ID = os.environ.get("LLM_ID", "openai:gpt-5.6-luna")
 DEFAULT_TIMEOUT_S = int(os.environ.get("RAG_TIMEOUT", "120"))
 # Folder ingest can take several minutes for many/large PDFs + real embeddings.
 # Use a much larger ceiling than /answer, configurable via env var.
@@ -37,6 +37,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WATCHED_FOLDER = os.environ.get("WATCHED_FOLDER", str(_REPO_ROOT / "watched_folder"))
 
 MODEL_CHOICES = [
+    "openai:gpt-5.6-sol",
+    "openai:gpt-5.6-terra",
+    "openai:gpt-5.6-luna",
     "openai:gpt-4o-mini",
     "openai:gpt-4o",
     "openai:gpt-4.1-mini",
@@ -55,6 +58,25 @@ MODEL_CHOICES = [
     "lmstudio:mistralai/magistral-small-2509",
     "mock:any",
 ]
+
+# Retrieval knobs sized to the model's context window. The GPT-5.6 family has a
+# ~1.05M-token window and can absorb far more retrieved text than the older
+# models, so it gets a wider cut; everything else keeps the modest defaults.
+# top_k moves with max_context_chars because the cap alone is not binding:
+# top_k chunks of CHUNK_SIZE (1600) is what actually bounds the context.
+WIDE_CONTEXT_PRESET = {"top_k": 20, "max_context_chars": 50000}
+MODEST_CONTEXT_PRESET = {"top_k": 6, "max_context_chars": 18000}
+
+
+def context_preset(llm_id):
+    """Retrieval preset for a model id: wide for GPT-5.6, modest otherwise."""
+    return WIDE_CONTEXT_PRESET if "gpt-5.6" in (llm_id or "") else MODEST_CONTEXT_PRESET
+
+
+def apply_context_preset(llm_id):
+    """Gradio callback: (top_k, max_context_chars) for the newly selected model."""
+    preset = context_preset(llm_id)
+    return preset["top_k"], preset["max_context_chars"]
 
 # Chat memory: keep the last N exchanges (1 exchange = 1 user msg + 1 assistant msg).
 CHAT_HISTORY_EXCHANGES = 50
@@ -791,6 +813,7 @@ def build_ui() -> gr.Blocks:
     initial_embedding_id = srv.get("embedding_id") or DEFAULT_EMBEDDING_ID
     initial_version = srv.get("version") or DEFAULT_VERSION
     initial_reranker_id = srv.get("reranker_id") or DEFAULT_RERANKER_ID
+    initial_preset = context_preset(DEFAULT_LLM_ID)
 
     with gr.Blocks(title="Local RAG") as demo:
         with gr.Row(elem_classes=["nb-header"]):
@@ -839,13 +862,13 @@ def build_ui() -> gr.Blocks:
                             )
                             launch_compatible = gr.Checkbox(
                                 label="launch.py-compatible (only query + llm_id)",
-                                value=True,
+                                value=False,
                             )
                         with gr.Row():
                             embedding_id = gr.Textbox(label="embedding_id", value=initial_embedding_id)
                             version = gr.Textbox(label="version", value=initial_version)
                         with gr.Row():
-                            top_k = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                            top_k = gr.Slider(1, 30, value=initial_preset["top_k"], step=1, label="top_k")
                             fetch_k = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
                         with gr.Row():
                             search_type = gr.Dropdown(
@@ -854,7 +877,8 @@ def build_ui() -> gr.Blocks:
                             mmr_lambda = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
                         with gr.Row():
                             max_context_chars = gr.Slider(
-                                2000, 50000, value=18000, step=500, label="max_context_chars",
+                                2000, 50000, value=initial_preset["max_context_chars"],
+                                step=500, label="max_context_chars",
                             )
                             timeout_s = gr.Slider(
                                 5, 600, value=DEFAULT_TIMEOUT_S, step=5, label="timeout (s)",
@@ -864,6 +888,13 @@ def build_ui() -> gr.Blocks:
                                 label="reranker_id", value=initial_reranker_id,
                                 placeholder="none: or ce:BAAI/bge-reranker-v2-m3",
                             )
+
+                        # Switching model resizes the retrieval knobs to its context window.
+                        llm_id.change(
+                            fn=apply_context_preset,
+                            inputs=[llm_id],
+                            outputs=[top_k, max_context_chars],
+                        )
 
                 last_query = gr.State("")
                 last_request = gr.State("{}")
@@ -982,7 +1013,7 @@ def build_ui() -> gr.Blocks:
                                         embedding_id_a = gr.Textbox(label="embedding_id", value=initial_embedding_id)
                                         version_a = gr.Textbox(label="version", value=initial_version)
                                     with gr.Row():
-                                        top_k_a = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                                        top_k_a = gr.Slider(1, 30, value=initial_preset["top_k"], step=1, label="top_k")
                                         fetch_k_a = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
                                     with gr.Row():
                                         search_type_a = gr.Dropdown(
@@ -990,7 +1021,8 @@ def build_ui() -> gr.Blocks:
                                         )
                                         mmr_lambda_a = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
                                     max_context_chars_a = gr.Slider(
-                                        2000, 50000, value=18000, step=500, label="max_context_chars",
+                                        2000, 50000, value=initial_preset["max_context_chars"],
+                                        step=500, label="max_context_chars",
                                     )
                                     reranker_id_a = gr.Textbox(
                                         label="reranker_id", value=initial_reranker_id,
@@ -1014,7 +1046,7 @@ def build_ui() -> gr.Blocks:
                                         embedding_id_b = gr.Textbox(label="embedding_id", value=initial_embedding_id)
                                         version_b = gr.Textbox(label="version", value=initial_version)
                                     with gr.Row():
-                                        top_k_b = gr.Slider(1, 30, value=6, step=1, label="top_k")
+                                        top_k_b = gr.Slider(1, 30, value=initial_preset["top_k"], step=1, label="top_k")
                                         fetch_k_b = gr.Slider(5, 80, value=24, step=1, label="fetch_k")
                                     with gr.Row():
                                         search_type_b = gr.Dropdown(
@@ -1022,7 +1054,8 @@ def build_ui() -> gr.Blocks:
                                         )
                                         mmr_lambda_b = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="mmr_lambda")
                                     max_context_chars_b = gr.Slider(
-                                        2000, 50000, value=18000, step=500, label="max_context_chars",
+                                        2000, 50000, value=initial_preset["max_context_chars"],
+                                        step=500, label="max_context_chars",
                                     )
                                     reranker_id_b = gr.Textbox(
                                         label="reranker_id", value=initial_reranker_id,
@@ -1033,6 +1066,12 @@ def build_ui() -> gr.Blocks:
                                         sources_b_json = gr.Code(language="json")
                                     with gr.Accordion("Raw API response (JSON)", open=False):
                                         raw_b_json = gr.Code(language="json")
+
+                        for _dd, _tk, _mc in (
+                            (llm_id_a, top_k_a, max_context_chars_a),
+                            (llm_id_b, top_k_b, max_context_chars_b),
+                        ):
+                            _dd.change(fn=apply_context_preset, inputs=[_dd], outputs=[_tk, _mc])
 
                         compare_btn.click(
                             fn=compare_step,

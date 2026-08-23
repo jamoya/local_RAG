@@ -700,6 +700,66 @@ def test_model_choices_use_providers_the_backend_supports():
             pass  # missing dependency or credentials -- not a UI/backend mismatch
 
 
+def test_default_llm_is_gpt_5_6_luna():
+    assert ga.DEFAULT_LLM_ID == "openai:gpt-5.6-luna"
+    assert ga.DEFAULT_LLM_ID in ga.MODEL_CHOICES
+
+
+def test_gpt_5_6_models_get_the_wide_context_preset():
+    for model in ("openai:gpt-5.6-sol", "openai:gpt-5.6-terra", "openai:gpt-5.6-luna"):
+        assert ga.context_preset(model) == ga.WIDE_CONTEXT_PRESET, model
+
+
+def test_other_models_get_the_modest_context_preset():
+    for model in ("openai:gpt-4o-mini", "anthropic:claude-sonnet-4-6",
+                  "ollama:llama3.2", "mock:any", "", None):
+        assert ga.context_preset(model) == ga.MODEST_CONTEXT_PRESET, model
+
+
+def test_wide_preset_is_actually_wider_and_top_k_is_the_binding_lever():
+    """max_context_chars alone is not binding -- top_k must move with it."""
+    wide, modest = ga.WIDE_CONTEXT_PRESET, ga.MODEST_CONTEXT_PRESET
+    assert wide["top_k"] > modest["top_k"]
+    assert wide["max_context_chars"] > modest["max_context_chars"]
+    # The cap must exceed what top_k chunks can produce, or it truncates instead.
+    assert wide["max_context_chars"] > wide["top_k"] * 1600
+
+
+def test_apply_context_preset_returns_slider_values_in_order():
+    assert ga.apply_context_preset("openai:gpt-5.6-luna") == (
+        ga.WIDE_CONTEXT_PRESET["top_k"], ga.WIDE_CONTEXT_PRESET["max_context_chars"])
+    assert ga.apply_context_preset("openai:gpt-4o") == (
+        ga.MODEST_CONTEXT_PRESET["top_k"], ga.MODEST_CONTEXT_PRESET["max_context_chars"])
+
+
+def test_preset_values_fit_the_slider_ranges():
+    """Presets outside the slider bounds would be silently clamped by Gradio."""
+    for preset in (ga.WIDE_CONTEXT_PRESET, ga.MODEST_CONTEXT_PRESET):
+        assert 1 <= preset["top_k"] <= 30
+        assert 2000 <= preset["max_context_chars"] <= 50000
+
+
+def test_launch_compatible_defaults_off_so_the_preset_reaches_the_server():
+    """With the switch on, build_request_body drops the retrieval knobs entirely,
+    which would make the per-model context preset a no-op in the default UI state."""
+    import requests
+    from unittest.mock import patch
+    with patch("requests.get", side_effect=requests.ConnectionError("offline")):
+        demo = ga.build_ui()
+    defaults = [c.value for c in demo.blocks.values()
+                if "launch.py-compatible" in (getattr(c, "label", None) or "")]
+    assert defaults == [False]
+
+    top_k, max_chars = ga.apply_context_preset(ga.DEFAULT_LLM_ID)
+    body = ga.build_request_body(
+        question="q", llm_id=ga.DEFAULT_LLM_ID, embedding_id="fake:any", version="v1",
+        top_k=top_k, fetch_k=24, search_type="mmr", mmr_lambda=0.3,
+        max_context_chars=max_chars, launch_compatible=False,
+    )
+    assert body["top_k"] == ga.WIDE_CONTEXT_PRESET["top_k"]
+    assert body["max_context_chars"] == ga.WIDE_CONTEXT_PRESET["max_context_chars"]
+
+
 def test_build_request_body_includes_reranker_id():
     body = ga.build_request_body(
         question="q", llm_id="mock:any", embedding_id="fake:any", version="v1",
