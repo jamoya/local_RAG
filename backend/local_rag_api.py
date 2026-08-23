@@ -19,6 +19,7 @@ import io
 import re
 import json
 import hashlib
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -163,6 +164,30 @@ _ACTIVE: Dict[str, str] = {
     "embedding_id": DEFAULT_EMBEDDING_ID,
     "version": DEFAULT_VERSION,
 }
+
+
+def _watch_upsert(source_path: str):
+    try:
+        _ingest_local_file(source_path, _ACTIVE["embedding_id"], _ACTIVE["version"])
+        print(f"file {Path(source_path).name} added to the database")
+    except Exception as e:
+        print(f"[error] watch ingest failed for {source_path}: {type(e).__name__}: {e}")
+
+
+def _watch_delete(source_path: str):
+    store, _, _, _ = get_store(_ACTIVE["embedding_id"], _ACTIVE["version"])
+    delete_by_source(store, source_path)
+    print(f"file {Path(source_path).name} removed from the database")
+
+
+_WATCHER: Optional[Any] = None
+
+
+def _start_watcher():
+    global _WATCHER
+    from watch_manager import WatchManager
+    _WATCHER = WatchManager(_watch_upsert, _watch_delete, sorted(SUPPORTED_EXTS))
+    _WATCHER.start(_ACTIVE["folder"])
 
 # ----------------------------
 # Utilities
@@ -392,6 +417,12 @@ _STORE_CACHE: Dict[str, Any] = {}
 
 _BACKFILLED: set = set()
 
+# The watcher's observer thread writes to Chroma alongside request threads.
+# RLock (not Lock) because _ingest_documents calls get_store and
+# delete_by_source while already holding the lock -- a plain Lock would
+# deadlock the thread against itself.
+_INGEST_LOCK = threading.RLock()
+
 def _backfill_folder_metadata(store: Any, cname: str) -> int:
     """Add the folder key to chunks written before it existed. Returns rows updated.
 
@@ -428,31 +459,35 @@ def get_store(embedding_id: str, version: str):
     key = f"{embedding_id}::{version}"
     if key in _STORE_CACHE:
         return _STORE_CACHE[key]
+    with _INGEST_LOCK:
+        if key in _STORE_CACHE:
+            return _STORE_CACHE[key]
 
-    cname = _collection_name(embedding_id, version)
+        cname = _collection_name(embedding_id, version)
 
-    # Prefer LangChain Chroma if available
-    if Chroma is not None:
-        emb = make_embeddings(embedding_id)
-        store = Chroma(collection_name=cname, persist_directory=CHROMA_PATH, embedding_function=emb)
-        _STORE_CACHE[key] = (store, emb, cname, "chroma")
-        if cname not in _BACKFILLED:
-            _backfill_folder_metadata(store, cname)
+        # Prefer LangChain Chroma if available
+        if Chroma is not None:
+            emb = make_embeddings(embedding_id)
+            store = Chroma(collection_name=cname, persist_directory=CHROMA_PATH, embedding_function=emb)
+            _STORE_CACHE[key] = (store, emb, cname, "chroma")
+            if cname not in _BACKFILLED:
+                _backfill_folder_metadata(store, cname)
+            return _STORE_CACHE[key]
+
+        # Fallback: in-memory TF-IDF store
+        store = _TfidfStore()
+        _STORE_CACHE[key] = (store, None, cname, "tfidf")
         return _STORE_CACHE[key]
 
-    # Fallback: in-memory TF-IDF store
-    store = _TfidfStore()
-    _STORE_CACHE[key] = (store, None, cname, "tfidf")
-    return _STORE_CACHE[key]
-
 def delete_by_source(store: Any, source_path: str):
-    if hasattr(store, "_collection"):
-        store._collection.delete(where={"source_path": source_path})
-        return
-    if hasattr(store, "delete"):
-        store.delete(source_path)
-        return
-    raise RuntimeError("Store does not support delete")
+    with _INGEST_LOCK:
+        if hasattr(store, "_collection"):
+            store._collection.delete(where={"source_path": source_path})
+            return
+        if hasattr(store, "delete"):
+            store.delete(source_path)
+            return
+        raise RuntimeError("Store does not support delete")
 
 # ----------------------------
 # Retrieval improvements
@@ -709,38 +744,39 @@ def delete():
 
 def _ingest_documents(docs: List[Document], source_path: str, embedding_id: str, version: str) -> Dict[str, Any]:
     """Chunk + upsert pre-loaded Documents. Shared by /ingest and /ingest_folder."""
-    store, _, cname, backend = get_store(embedding_id, version)
-    delete_by_source(store, source_path)
+    with _INGEST_LOCK:
+        store, _, cname, backend = get_store(embedding_id, version)
+        delete_by_source(store, source_path)
 
-    folder = _folder_of(source_path)
-    chunks = split_documents(docs)
-    for idx, d in enumerate(chunks):
-        md = dict(d.metadata or {})
-        md["chunk"] = idx
-        md["folder"] = folder
-        md["id"] = doc_id(source_path, md.get("page"), idx)
-        d.metadata = md
+        folder = _folder_of(source_path)
+        chunks = split_documents(docs)
+        for idx, d in enumerate(chunks):
+            md = dict(d.metadata or {})
+            md["chunk"] = idx
+            md["folder"] = folder
+            md["id"] = doc_id(source_path, md.get("page"), idx)
+            d.metadata = md
 
-    if hasattr(store, "add_documents"):
-        store.add_documents(chunks)
-    elif hasattr(store, "_collection"):
-        store.add_texts(
-            [c.page_content for c in chunks],
-            metadatas=[c.metadata for c in chunks],
-            ids=[c.metadata["id"] for c in chunks],
-        )
-    else:
-        raise RuntimeError("Store does not support add_documents")
+        if hasattr(store, "add_documents"):
+            store.add_documents(chunks)
+        elif hasattr(store, "_collection"):
+            store.add_texts(
+                [c.page_content for c in chunks],
+                metadatas=[c.metadata for c in chunks],
+                ids=[c.metadata["id"] for c in chunks],
+            )
+        else:
+            raise RuntimeError("Store does not support add_documents")
 
-    return {
-        "collection": cname,
-        "backend": backend,
-        "embedding_id": embedding_id,
-        "version": version,
-        "pages_loaded": len(docs),
-        "chunks_added": len(chunks),
-        "total_chars": sum(len(d.page_content or "") for d in docs),
-    }
+        return {
+            "collection": cname,
+            "backend": backend,
+            "embedding_id": embedding_id,
+            "version": version,
+            "pages_loaded": len(docs),
+            "chunks_added": len(chunks),
+            "total_chars": sum(len(d.page_content or "") for d in docs),
+        }
 
 
 def _ingest_local_file(source_path: str, embedding_id: str, version: str) -> Dict[str, Any]:
@@ -964,6 +1000,8 @@ def watched_folder():
 
     folder_registry.set_active(CHROMA_PATH, str(folder_path))
     _ACTIVE.update({"folder": str(folder_path), "embedding_id": embedding_id, "version": version})
+    if _WATCHER is not None:
+        _WATCHER.repoint(str(folder_path))
 
     res = sync_folder(str(folder_path), embedding_id, version)
     return jsonify({"status": "ok", "active_folder": str(folder_path),
@@ -1158,4 +1196,5 @@ def answer():
 
 if __name__ == "__main__":
     os.makedirs(CHROMA_PATH, exist_ok=True)
-    app.run(host=HOST, port=PORT, debug=True)
+    _start_watcher()
+    app.run(host=HOST, port=PORT, debug=True, use_reloader=False)

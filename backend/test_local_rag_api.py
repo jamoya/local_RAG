@@ -743,3 +743,25 @@ def test_watched_folder_rejects_a_file_path(client, tmp_path):
     f.write_text("not a folder")
     r = client.post("/watched_folder", json={"folder": str(f)})
     assert r.status_code == 400
+
+
+def test_watched_folder_repoints_the_watcher(client, tmp_path):
+    import local_rag_api as mod
+
+    class Spy:
+        def __init__(self):
+            self.folder = None
+
+        def repoint(self, folder):
+            self.folder = folder
+
+    spy = Spy()
+    mod._WATCHER = spy
+    try:
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        r = client.post("/watched_folder", json={"folder": str(folder), "embedding_id": "fake:any", "version": "vtest"})
+        assert r.status_code == 200, r.data
+        assert spy.folder == str(folder.resolve())
+    finally:
+        mod._WATCHER = None
