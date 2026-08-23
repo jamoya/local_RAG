@@ -65,7 +65,7 @@ Checked against the installed libraries, not assumed:
 
 ## Architecture
 
-```
+```text
 Gradio UI                      Flask API process
   Folders panel  --POST /watched_folder-->  folder_registry  (folders.json)
                  --GET  /folders -------->  (counts per active collection)
@@ -121,7 +121,7 @@ Three-way reconciliation. This is the component that satisfies the "check everyt
 is ingested" requirement.
 
 | Input | Answers |
-|---|---|
+| --- | --- |
 | `scan_disk(folder, exts, recursive=False)` | what is on disk now |
 | store, `where={"folder": folder}` | what is actually ingested |
 | `.ingested_state__*.json` | mtime and size, to skip unchanged files |
@@ -172,7 +172,7 @@ Two consequences:
 ## API changes
 
 | Endpoint | Change |
-|---|---|
+| --- | --- |
 | `POST /watched_folder` | New. Body `{folder, embedding_id?, version?}`. Validates the directory, sets it active in the registry, runs `sync_folder`, repoints the observer, returns the sync summary plus `active_folder`. 400 if not a directory. |
 | `GET /folders` | New. Accepts optional `?embedding_id=` and `?version=` like `/sources`, defaulting to the server's, and reports against that one collection — a folder may hold documents under several embedding models, and mixing counts across collections would be misleading. Returns `{active, chroma_path, collection, folders: [{path, exists, file_count}]}` — the union of registry `known` and folders present in that collection, so a folder with zero documents in it still appears. |
 | `GET /sources` | Optional `?folder=` filters by the `folder` metadata key. Omitted means all, as today. |
@@ -193,7 +193,7 @@ working, which CLAUDE.md requires.
 
 The left column becomes two panels:
 
-```
+```text
 Folders                             1 DB · ./local_chroma_db
 [ /Users/jm/.../watched_folder   v ]
 [ Use this folder ]
