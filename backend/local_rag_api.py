@@ -658,27 +658,34 @@ def ready():
     except Exception as e:
         return jsonify({"status": "not_ready", "error": str(e)}), 503
 
-@app.get("/sources")
-def sources():
-    embedding_id = request.args.get("embedding_id", DEFAULT_EMBEDDING_ID)
-    version = request.args.get("version", DEFAULT_VERSION)
-    store, _, cname, backend = get_store(embedding_id, version)
+def _sources_in(store: Any, folder: Optional[str] = None) -> List[str]:
+    """Distinct source paths in the store, optionally restricted to one folder."""
+    where = {"folder": folder} if folder else None
     if hasattr(store, "_collection"):
         # Chroma's SQLite backend binds one variable per row, so a single large
         # get() raises "too many SQL variables" past ~32k chunks. Page instead.
         found = set()
         offset, page = 0, 10000
         while True:
-            metas = store._collection.get(include=["metadatas"], limit=page, offset=offset).get("metadatas") or []
+            got = store._collection.get(include=["metadatas"], limit=page, offset=offset, where=where)
+            metas = got.get("metadatas") or []
             found.update((m or {}).get("source_path") for m in metas if (m or {}).get("source_path"))
             if len(metas) < page:
                 break
             offset += page
-        srcs = sorted(found)
-    else:
-        # fallback store
-        srcs = sorted({(d.metadata or {}).get("source_path") for d in getattr(store, "_docs", []) if (d.metadata or {}).get("source_path")})
-    return jsonify({"sources": srcs, "collection": cname, "backend": backend, "embedding_id": embedding_id, "version": version})
+        return sorted(found)
+    docs = [d for d in getattr(store, "_docs", []) if _md_matches(d.metadata, where)]
+    return sorted({(d.metadata or {}).get("source_path") for d in docs if (d.metadata or {}).get("source_path")})
+
+@app.get("/sources")
+def sources():
+    embedding_id = request.args.get("embedding_id", DEFAULT_EMBEDDING_ID)
+    version = request.args.get("version", DEFAULT_VERSION)
+    folder = request.args.get("folder") or None
+    store, _, cname, backend = get_store(embedding_id, version)
+    srcs = _sources_in(store, folder)
+    return jsonify({"sources": srcs, "collection": cname, "backend": backend,
+                    "embedding_id": embedding_id, "version": version, "folder": folder})
 
 @app.post("/delete")
 def delete():

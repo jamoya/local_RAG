@@ -300,7 +300,7 @@ def test_sources_pages_instead_of_one_huge_get(tmp_path):
             self.rows = [{"source_path": f"/docs/f{i}.pdf"} for i in range(n)]
             self.max_limit_seen = 0
 
-        def get(self, include=None, limit=None, offset=0):
+        def get(self, include=None, limit=None, offset=0, where=None):
             self.max_limit_seen = max(self.max_limit_seen, limit or 0)
             if (limit or 0) > self.MAX:
                 raise RuntimeError("too many SQL variables")
@@ -321,6 +321,20 @@ def test_sources_pages_instead_of_one_huge_get(tmp_path):
         assert coll.max_limit_seen <= _Collection.MAX
     finally:
         mod.get_store = original
+
+
+def test_sources_filters_by_folder(client, tmp_path):
+    a = tmp_path / "alpha" / "a.txt"
+    b = tmp_path / "beta" / "b.txt"
+    _ingest_text(client, a, "alpha content about dust limits")
+    _ingest_text(client, b, "beta content about dust limits")
+
+    r = client.get(f"/sources?embedding_id=fake:any&version=vtest&folder={(tmp_path / 'alpha').resolve()}")
+    assert r.status_code == 200, r.data
+    assert r.get_json()["sources"] == [str(a.resolve())]
+
+    r = client.get("/sources?embedding_id=fake:any&version=vtest")
+    assert set(r.get_json()["sources"]) == {str(a.resolve()), str(b.resolve())}
 
 
 def test_reranker_disabled_by_default(tmp_path):
