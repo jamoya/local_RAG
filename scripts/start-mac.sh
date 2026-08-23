@@ -141,7 +141,7 @@ if [[ -d "$WATCH_DIR" ]]; then
     EMB_ID="${EMBEDDING_ID:-tfidf:local}"
     VER="${CHROMA_COLLECTION_VERSION:-v1}"
     echo "Starting watcher on $WATCH_DIR (embedding=$EMB_ID, version=$VER)"
-    nohup uv run python backend/folder_watcher.py \
+    nohup uv run python -u backend/folder_watcher.py \
       --watch "$WATCH_DIR" \
       --api "$API_BASE" \
       --embedding-id "$EMB_ID" \
@@ -162,7 +162,7 @@ if [[ -f "$UI_PID_FILE" ]] && is_pid_alive "$(cat "$UI_PID_FILE")"; then
   echo "UI already running (pid $(cat "$UI_PID_FILE")). Skipping."
 else
   echo "Starting UI -> $UI_BASE"
-  nohup uv run python frontend/gradio_app.py >>"$LOG_DIR/gradio.log" 2>&1 &
+  nohup uv run python -u frontend/gradio_app.py >>"$LOG_DIR/gradio.log" 2>&1 &
   echo $! > "$UI_PID_FILE"
 fi
 

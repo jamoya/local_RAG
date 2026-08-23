@@ -406,3 +406,29 @@ def test_ingest_folder_skips_unchanged_on_second_call(client, tmp_path):
     js = r2.get_json()
     assert js["ingested"] == []
     assert js["skipped_unchanged"] == 1
+
+
+def test_retrieval_query_expands_anaphoric_followup():
+    """A pronoun follow-up retrieves on the previous user turn, not the pronoun."""
+    from local_rag_api import _retrieval_query
+
+    history = [
+        {"role": "user", "content": "What is acetone mainly used for?"},
+        {"role": "assistant", "content": "As a solvent and chemical intermediate."},
+    ]
+    assert _retrieval_query("How is it produced industrially?", history) == (
+        "What is acetone mainly used for? How is it produced industrially?"
+    )
+
+
+def test_retrieval_query_leaves_self_contained_followup_alone():
+    """A follow-up naming its own subject must not be diluted by the prior turn."""
+    from local_rag_api import _retrieval_query
+
+    history = [
+        {"role": "user", "content": "What is acetone mainly used for?"},
+        {"role": "assistant", "content": "As a solvent."},
+    ]
+    q = "What is the boiling point of benzene?"
+    assert _retrieval_query(q, history) == q
+    assert _retrieval_query(q, []) == q

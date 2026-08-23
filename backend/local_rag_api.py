@@ -842,6 +842,33 @@ def retrieve():
 
 MAX_HISTORY_MESSAGES = 100  # 50 user/assistant exchanges
 
+_ANAPHORA_RE = re.compile(
+    r"\b(it|its|it's|they|them|their|this|that|these|those|he|she|his|her|one)\b",
+    re.IGNORECASE,
+)
+
+
+def _retrieval_query(question: str, history) -> str:
+    """Return the query to search on, expanded when it refers back to the chat.
+
+    Retrieval runs on the question alone, so a follow-up like "How is it
+    produced industrially?" would search on the pronoun and return documents
+    about an unrelated subject -- the LLM still resolves "it" from history and
+    presents that wrong context as an answer. Prepending the previous user turn
+    restores the subject. Questions naming their own subject are left untouched
+    so an unrelated follow-up is not diluted by the previous topic.
+    """
+    if not history or not _ANAPHORA_RE.search(question):
+        return question
+    for item in reversed(history[-MAX_HISTORY_MESSAGES:]):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).strip().lower() not in {"user", "human"}:
+            continue
+        previous = str(item.get("content") or "").strip()
+        return f"{previous} {question}" if previous else question
+    return question
+
 
 def _build_chat_messages(
     system_text: str,
@@ -922,7 +949,8 @@ def answer():
         history = []
 
     store, _, cname, backend = get_store(embedding_id, version)
-    docs = retrieve_docs(store, question, top_k=top_k, fetch_k=fetch_k, search_type=search_type, mmr_lambda=mmr_lambda,
+    docs = retrieve_docs(store, _retrieval_query(question, history), top_k=top_k, fetch_k=fetch_k,
+                         search_type=search_type, mmr_lambda=mmr_lambda,
                          reranker_id=reranker_id)
     context, sources = format_context(docs, max_chars)
 
