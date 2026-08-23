@@ -779,3 +779,117 @@ def test_watch_delete_swallows_exceptions(client, monkeypatch):
     monkeypatch.setattr(mod, "delete_by_source", _raise)
 
     mod._watch_delete("/nonexistent/does-not-matter.txt")
+
+
+def test_sync_with_narrowed_extensions_does_not_delete_other_types(tmp_path):
+    """`extensions` limits what gets ingested; it must not widen what gets deleted."""
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.txt").write_text("text content about dust limits")
+    (folder / "b.md").write_text("markdown content about dust limits")
+    mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    res = mod.sync_folder(str(folder), "fake:any", "vtest", extensions=[".pdf"])
+
+    assert res["deleted"] == []
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    assert len(mod._sources_in(store, str(folder.resolve()))) == 2
+
+
+def test_sync_deletes_only_within_the_requested_extensions(tmp_path):
+    """A removed .txt is still deleted when the sync is scoped to .txt."""
+    app = _make_app(tmp_path)
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    keep = folder / "keep.md"
+    gone = folder / "gone.txt"
+    keep.write_text("markdown that stays")
+    gone.write_text("text that goes")
+    mod.sync_folder(str(folder), "fake:any", "vtest")
+
+    gone.unlink()
+    res = mod.sync_folder(str(folder), "fake:any", "vtest", extensions=[".txt"])
+
+    assert res["deleted"] == [str(gone.resolve())]
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    assert mod._sources_in(store, str(folder.resolve())) == [str(keep.resolve())]
+
+
+def test_watched_folder_default_is_resolved_like_chunk_metadata(tmp_path):
+    """A symlinked watched folder must not make every scoped query miss.
+
+    Chunks store folder = Path(source_path).resolve().parent, so the default
+    watched folder has to be resolved the same way or the where-filter never
+    matches and scoped answers come back silently empty.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    os.environ["WATCHED_FOLDER"] = str(link)
+    try:
+        app = _make_app(tmp_path)  # noqa: F841
+        import local_rag_api as mod
+        assert mod.WATCHED_FOLDER == str(real.resolve())
+        assert mod.WATCHED_FOLDER == mod._folder_of(str(link / "any.txt"))
+    finally:
+        del os.environ["WATCHED_FOLDER"]
+
+
+def test_watch_upsert_records_the_fingerprint_so_sync_does_not_re_embed(tmp_path):
+    """The in-process watcher must update the state file like the old daemon did.
+
+    Without it every later sync sees no fingerprint, treats the file as changed,
+    and re-embeds the whole folder on each refresh.
+    """
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    f = folder / "a.txt"
+    f.write_text("dust limit is 5 mg per normal cubic metre")
+
+    mod._ACTIVE.update({"folder": str(folder.resolve()),
+                        "embedding_id": "fake:any", "version": "vtest"})
+    mod._watch_upsert(str(f.resolve()))
+
+    res = mod.sync_folder(str(folder), "fake:any", "vtest")
+    assert res["ingested"] == []
+    assert res["skipped_unchanged"] == 1
+
+
+def test_watch_upsert_skips_a_file_it_already_ingested_unchanged(tmp_path):
+    """watchdog emits created AND modified for one write; the second is a no-op."""
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    f = folder / "a.txt"
+    f.write_text("dust limit is 5 mg per normal cubic metre")
+
+    mod._ACTIVE.update({"folder": str(folder.resolve()),
+                        "embedding_id": "fake:any", "version": "vtest"})
+
+    calls = []
+    real = mod._ingest_local_file
+
+    def counting(path, emb, ver):
+        calls.append(path)
+        return real(path, emb, ver)
+
+    mod._ingest_local_file = counting
+    try:
+        mod._watch_upsert(str(f.resolve()))
+        mod._watch_upsert(str(f.resolve()))
+    finally:
+        mod._ingest_local_file = real
+
+    assert len(calls) == 1

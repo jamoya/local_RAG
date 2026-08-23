@@ -822,7 +822,13 @@ def chat_step(
 
 
 def _scoped_folder(restrict: bool, folder: str) -> str:
-    """The folder to scope retrieval by; blank means search every folder."""
+    """The folder to scope retrieval by; blank means search every folder.
+
+    This reads the dropdown, which is the *selected* folder -- not necessarily
+    the server's active one, since the dropdown accepts typed paths and only
+    "Use this folder" commits a switch. The checkbox label says "selected" for
+    that reason.
+    """
     return (folder or "") if restrict else ""
 
 
@@ -982,7 +988,7 @@ def build_ui() -> gr.Blocks:
                                 value=False,
                             )
                             restrict_to_folder = gr.Checkbox(
-                                label="restrict retrieval to active folder",
+                                label="restrict retrieval to the selected folder",
                                 value=True,
                             )
                         with gr.Row():
@@ -1224,11 +1230,14 @@ def build_ui() -> gr.Blocks:
                 api_base_v, embedding_id_v, version_v, timeout_v, folder=active,
             )
             banner = _format_ingest_banner(summary, err)
+            # Fall back to the active folder when the API call failed: an empty
+            # payload must not leave the user with an empty dropdown.
+            choices = [f["path"] for f in (payload.get("folders") or [])] or [active]
             return (
                 render_folders_html(payload),
                 (banner + panel_html) if banner else panel_html,
                 pill,
-                gr.update(choices=[f["path"] for f in (payload.get("folders") or [])], value=active),
+                gr.update(choices=choices, value=active),
             )
 
         use_folder_btn.click(

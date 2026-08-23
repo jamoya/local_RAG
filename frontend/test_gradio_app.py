@@ -926,7 +926,7 @@ def test_model_choices_include_local_generators():
 
 
 # ----------------------------
-# restrict retrieval to the active folder
+# restrict retrieval to the selected folder
 # ----------------------------
 
 def test_build_request_body_includes_folder():
@@ -1085,3 +1085,19 @@ def test_on_use_folder_reports_the_sync_and_moves_the_dropdown(tmp_path):
     assert "1 removed" in panel
     assert update.get("value") == folder
     assert folder in folders_html
+
+
+def test_on_use_folder_keeps_the_dropdown_populated_when_the_api_fails():
+    """A failed switch must not leave the user with an empty folder list."""
+    import requests as _rq
+
+    def boom(*a, **k):
+        raise _rq.ConnectionError("offline")
+
+    cbs = _built_callbacks()
+    with patch("requests.get", side_effect=boom), patch("requests.post", side_effect=boom):
+        _, panel, pill, update = cbs["on_use_folder"]("http://api", "/data/alpha", "fake:any", "v1", 5)
+
+    assert update.get("choices") == ["/data/alpha"]
+    assert update.get("value") == "/data/alpha"
+    assert "Ingest failed" in panel

@@ -153,8 +153,12 @@ DEFAULT_RERANKER_ID = os.environ.get("RERANKER_ID", "none:")
 
 SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".docx"}
 
-WATCHED_FOLDER = os.path.abspath(
-    os.environ.get("WATCHED_FOLDER", os.path.join(os.getcwd(), "watched_folder"))
+# Resolved, not just made absolute: chunks record folder as
+# Path(source_path).resolve().parent, and a where-filter is exact string
+# equality. A symlinked watched folder left unresolved would never match, so
+# every folder-scoped query would come back silently empty.
+WATCHED_FOLDER = str(
+    Path(os.environ.get("WATCHED_FOLDER", os.path.join(os.getcwd(), "watched_folder"))).expanduser().resolve()
 )
 
 app = Flask(__name__)
@@ -167,18 +171,55 @@ _ACTIVE: Dict[str, str] = {
 
 
 def _watch_upsert(source_path: str):
+    """Ingest a watched file, sharing sync_folder's fingerprint state.
+
+    Reading the state makes the duplicate event watchdog emits for a single
+    write (created then modified) a no-op; writing it stops the next sync from
+    re-embedding everything the watcher already ingested.
+    """
+    from folder_watcher import state_file_path, load_state, save_state, file_fingerprint
+
+    p = Path(source_path)
+    embedding_id, version = _ACTIVE["embedding_id"], _ACTIVE["version"]
     try:
-        _ingest_local_file(source_path, _ACTIVE["embedding_id"], _ACTIVE["version"])
-        print(f"file {Path(source_path).name} added to the database")
+        fp = file_fingerprint(p)
+    except FileNotFoundError:
+        return
+
+    state_path = state_file_path(p.parent, version, embedding_id)
+    state = load_state(state_path)
+    files_state = state.setdefault("files", {})
+    prev = files_state.get(source_path)
+    if prev and prev.get("mtime") == fp["mtime"] and prev.get("size") == fp["size"]:
+        return
+
+    try:
+        _ingest_local_file(source_path, embedding_id, version)
+        files_state[source_path] = fp
+        save_state(state_path, state)
+        print(f"file {p.name} added to the database")
     except Exception as e:
         print(f"[error] watch ingest failed for {source_path}: {type(e).__name__}: {e}")
 
 
 def _watch_delete(source_path: str):
+    """Drop a watched file's vectors, and its fingerprint along with them.
+
+    Clearing the fingerprint matters: a file restored later with the same mtime
+    and size would otherwise look unchanged and never be re-ingested.
+    """
+    from folder_watcher import state_file_path, load_state, save_state
+
+    p = Path(source_path)
+    embedding_id, version = _ACTIVE["embedding_id"], _ACTIVE["version"]
     try:
-        store, _, _, _ = get_store(_ACTIVE["embedding_id"], _ACTIVE["version"])
+        store, _, _, _ = get_store(embedding_id, version)
         delete_by_source(store, source_path)
-        print(f"file {Path(source_path).name} removed from the database")
+        state_path = state_file_path(p.parent, version, embedding_id)
+        state = load_state(state_path)
+        if state.setdefault("files", {}).pop(source_path, None) is not None:
+            save_state(state_path, state)
+        print(f"file {p.name} removed from the database")
     except Exception as e:
         print(f"[error] watch delete failed for {source_path}: {type(e).__name__}: {e}")
 
@@ -187,10 +228,19 @@ _WATCHER: Optional[Any] = None
 
 
 def _start_watcher():
+    """Start watching the active folder, creating it if it is not there yet.
+
+    watched_folder/ is gitignored, so on a fresh clone it does not exist. On
+    macOS scheduling a watch on a missing directory neither raises nor delivers
+    events -- the watcher would be silently dead -- and on Linux it raises and
+    would stop the API from starting at all.
+    """
     global _WATCHER
     from watch_manager import WatchManager
+    folder = Path(_ACTIVE["folder"])
+    folder.mkdir(parents=True, exist_ok=True)
     _WATCHER = WatchManager(_watch_upsert, _watch_delete, sorted(SUPPORTED_EXTS))
-    _WATCHER.start(_ACTIVE["folder"])
+    _WATCHER.start(str(folder))
 
 # ----------------------------
 # Utilities
@@ -472,9 +522,13 @@ def get_store(embedding_id: str, version: str):
         if Chroma is not None:
             emb = make_embeddings(embedding_id)
             store = Chroma(collection_name=cname, persist_directory=CHROMA_PATH, embedding_function=emb)
-            _STORE_CACHE[key] = (store, emb, cname, "chroma")
+            # Backfill before publishing to the cache: the fast path above reads
+            # _STORE_CACHE without the lock, so a store published early is
+            # reachable by another thread mid-backfill, and a folder-filtered
+            # query would silently skip the chunks not yet carrying the key.
             if cname not in _BACKFILLED:
                 _backfill_folder_metadata(store, cname)
+            _STORE_CACHE[key] = (store, emb, cname, "chroma")
             return _STORE_CACHE[key]
 
         # Fallback: in-memory TF-IDF store
@@ -943,8 +997,17 @@ def sync_folder(folder: str, embedding_id: str, version: str,
         except Exception as e:
             errors.append({"source_path": path_str, "error": f"{type(e).__name__}: {e}"})
 
-    for path_str in sorted(indexed - disk):
-        delete_by_source(store, path_str)
+    # Only files of the requested types are candidates for deletion. `extensions`
+    # narrows what a sync looks at; without this it would also widen what it
+    # removes, so a .pdf-only sync would wipe the folder's .txt and .md vectors.
+    lowered = [e.lower() for e in exts]
+    removable = {p for p in indexed if Path(p).suffix.lower() in lowered}
+    for path_str in sorted(removable - disk):
+        try:
+            delete_by_source(store, path_str)
+        except Exception as e:
+            errors.append({"source_path": path_str, "error": f"{type(e).__name__}: {e}"})
+            continue
         files_state.pop(path_str, None)
         deleted.append(path_str)
         print(f"file {Path(path_str).name} removed from the database")
