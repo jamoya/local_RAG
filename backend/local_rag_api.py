@@ -175,9 +175,12 @@ def _watch_upsert(source_path: str):
 
 
 def _watch_delete(source_path: str):
-    store, _, _, _ = get_store(_ACTIVE["embedding_id"], _ACTIVE["version"])
-    delete_by_source(store, source_path)
-    print(f"file {Path(source_path).name} removed from the database")
+    try:
+        store, _, _, _ = get_store(_ACTIVE["embedding_id"], _ACTIVE["version"])
+        delete_by_source(store, source_path)
+        print(f"file {Path(source_path).name} removed from the database")
+    except Exception as e:
+        print(f"[error] watch delete failed for {source_path}: {type(e).__name__}: {e}")
 
 
 _WATCHER: Optional[Any] = None

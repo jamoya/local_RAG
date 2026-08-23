@@ -765,3 +765,17 @@ def test_watched_folder_repoints_the_watcher(client, tmp_path):
         assert spy.folder == str(folder.resolve())
     finally:
         mod._WATCHER = None
+
+
+def test_watch_delete_swallows_exceptions(client, monkeypatch):
+    """A failed delete must not escape _watch_delete -- it runs on the single
+    observer dispatcher thread, and watchdog only catches queue.Empty around
+    dispatch, so any other exception would silently end all future watching."""
+    import local_rag_api as mod
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mod, "delete_by_source", _raise)
+
+    mod._watch_delete("/nonexistent/does-not-matter.txt")
