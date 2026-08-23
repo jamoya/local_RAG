@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start the Local RAG stack (API + folder watcher) in the background.
+# Start the Local RAG stack (API + Gradio UI) in the background.
+# The API owns folder watching in-process, so there is no separate watcher.
 # Logs go to logs/, pid files to logs/*.pid.
 set -euo pipefail
 
@@ -44,8 +45,8 @@ GEN_ID="${LLM_ID:-mock:any}"
 # --- Preflight: external model servers ---
 # An `ollama:` embedding_id or llm_id makes Ollama a hard dependency. The API's
 # /health and /ready both return 200 without it -- embeddings are only contacted
-# on the first ingest or query -- so check it here or the watcher fails silently
-# on every file.
+# on the first ingest or query -- so check it here or the API's watcher fails
+# silently on every file.
 OLLAMA_URL="${OLLAMA_HOST:-http://localhost:11434}"
 
 model_present() {
@@ -109,7 +110,9 @@ if [[ -f "$API_PID_FILE" ]] && is_pid_alive "$(cat "$API_PID_FILE")"; then
   echo "API already running (pid $(cat "$API_PID_FILE")). Skipping."
 else
   echo "Starting API -> $API_BASE"
-  nohup uv run python backend/local_rag_api.py >>"$LOG_DIR/api.log" 2>&1 &
+  # -u because the API now owns folder watching: its "file X added to the
+  # database" lines must reach api.log live, not sit in a block buffer.
+  nohup uv run python -u backend/local_rag_api.py >>"$LOG_DIR/api.log" 2>&1 &
   echo $! > "$API_PID_FILE"
 fi
 
@@ -131,28 +134,9 @@ if ! curl -fsS "$API_BASE/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-# --- Watcher (only if watched_folder exists) ---
-WATCH_DIR="$ROOT/watched_folder"
-WATCH_PID_FILE="$LOG_DIR/watcher.pid"
-if [[ -d "$WATCH_DIR" ]]; then
-  if [[ -f "$WATCH_PID_FILE" ]] && is_pid_alive "$(cat "$WATCH_PID_FILE")"; then
-    echo "Watcher already running (pid $(cat "$WATCH_PID_FILE")). Skipping."
-  else
-    EMB_ID="${EMBEDDING_ID:-tfidf:local}"
-    VER="${CHROMA_COLLECTION_VERSION:-v1}"
-    echo "Starting watcher on $WATCH_DIR (embedding=$EMB_ID, version=$VER)"
-    nohup uv run python -u backend/folder_watcher.py \
-      --watch "$WATCH_DIR" \
-      --api "$API_BASE" \
-      --embedding-id "$EMB_ID" \
-      --version "$VER" \
-      --reconcile-interval 300 \
-      >>"$LOG_DIR/watcher.log" 2>&1 &
-    echo $! > "$WATCH_PID_FILE"
-  fi
-else
-  echo "No watched_folder/ at $WATCH_DIR -- skipping watcher."
-fi
+# --- Watcher ---
+# The API process now owns folder watching (see backend/watch_manager.py) and
+# repoints itself when the UI switches folders. No separate watcher process.
 
 # --- Gradio UI ---
 # Started after the API so its startup probe of GET /config finds a live backend
@@ -186,7 +170,6 @@ echo
 echo "Stack is up:"
 echo "  UI:      $UI_BASE   (logs: $LOG_DIR/gradio.log)   <- open this in your browser"
 echo "  API:     $API_BASE   (logs: $LOG_DIR/api.log)"
-[[ -f "$WATCH_PID_FILE" ]] && echo "  Watcher: pid $(cat "$WATCH_PID_FILE")  (logs: $LOG_DIR/watcher.log)"
 echo
 echo "Try:"
 echo "  curl -s -X POST $API_BASE/answer -H 'Content-Type: application/json' \\"

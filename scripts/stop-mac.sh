@@ -34,8 +34,11 @@ stop_pid_file() {
 }
 
 stop_pid_file "ui"      "$LOG_DIR/ui.pid"
-stop_pid_file "watcher" "$LOG_DIR/watcher.pid"
 stop_pid_file "api"     "$LOG_DIR/api.pid"
+
+# Legacy: the watcher used to be its own process. Stop and clear any pid file
+# left over from a stack started before watching moved into the API.
+[[ -f "$LOG_DIR/watcher.pid" ]] && stop_pid_file "watcher" "$LOG_DIR/watcher.pid"
 
 # Only present when start-mac.sh had to start Ollama itself. An Ollama the user
 # was already running (or the desktop app) has no pid file and is left alone.
