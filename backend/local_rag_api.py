@@ -165,6 +165,10 @@ def _slug(s: str) -> str:
 def _collection_name(embedding_id: str, version: str) -> str:
     return f"{BASE_COLLECTION}__{version}__{_slug(embedding_id)}"
 
+def _folder_of(source_path: str) -> str:
+    """Absolute parent directory of a source file, the key retrieval is scoped by."""
+    return str(Path(source_path).resolve().parent)
+
 def _normalize_extracted_text(text: str) -> str:
     if not text:
         return ""
@@ -371,6 +375,40 @@ class _TfidfStore:
 # Cache stores per (embedding_id, version)
 _STORE_CACHE: Dict[str, Any] = {}
 
+_BACKFILLED: set = set()
+
+def _backfill_folder_metadata(store: Any, cname: str) -> int:
+    """Add the folder key to chunks written before it existed. Returns rows updated.
+
+    Chroma merges metadata on update and leaves embeddings untouched, so this
+    costs no re-embedding. Rows without the key are invisible to a folder
+    filter, which is why this runs before any filtered read.
+    """
+    coll = getattr(store, "_collection", None)
+    if coll is None:
+        return 0
+
+    updated = 0
+    offset, page = 0, 10000
+    while True:
+        got = coll.get(include=["metadatas"], limit=page, offset=offset)
+        ids = got.get("ids") or []
+        metas = got.get("metadatas") or []
+        stale_ids, stale_metas = [], []
+        for cid, md in zip(ids, metas):
+            md = md or {}
+            if not md.get("folder") and md.get("source_path"):
+                stale_ids.append(cid)
+                stale_metas.append({"folder": _folder_of(md["source_path"])})
+        if stale_ids:
+            coll.update(ids=stale_ids, metadatas=stale_metas)
+            updated += len(stale_ids)
+        if len(ids) < page:
+            break
+        offset += page
+    _BACKFILLED.add(cname)
+    return updated
+
 def get_store(embedding_id: str, version: str):
     key = f"{embedding_id}::{version}"
     if key in _STORE_CACHE:
@@ -383,6 +421,8 @@ def get_store(embedding_id: str, version: str):
         emb = make_embeddings(embedding_id)
         store = Chroma(collection_name=cname, persist_directory=CHROMA_PATH, embedding_function=emb)
         _STORE_CACHE[key] = (store, emb, cname, "chroma")
+        if cname not in _BACKFILLED:
+            _backfill_folder_metadata(store, cname)
         return _STORE_CACHE[key]
 
     # Fallback: in-memory TF-IDF store
@@ -649,10 +689,12 @@ def _ingest_documents(docs: List[Document], source_path: str, embedding_id: str,
     store, _, cname, backend = get_store(embedding_id, version)
     delete_by_source(store, source_path)
 
+    folder = _folder_of(source_path)
     chunks = split_documents(docs)
     for idx, d in enumerate(chunks):
         md = dict(d.metadata or {})
         md["chunk"] = idx
+        md["folder"] = folder
         md["id"] = doc_id(source_path, md.get("page"), idx)
         d.metadata = md
 

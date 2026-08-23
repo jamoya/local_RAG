@@ -69,6 +69,30 @@ def test_ingest_retrieve_answer_txt(client, tmp_path):
     ans = r.get_json()["answer"]
     assert "MOCK_ANSWER" in ans
 
+def test_ingest_stamps_folder_metadata(client, tmp_path):
+    docdir = tmp_path / "docs"
+    docdir.mkdir()
+    src = docdir / "a.txt"
+    src.write_text("BAT-AEL for electric arc furnace dust is 5 mg per normal cubic metre.")
+
+    r = client.post(
+        "/ingest",
+        data={
+            "embedding_id": "fake:any",
+            "version": "vtest",
+            "source_path": str(src),
+            "file": (io.BytesIO(src.read_bytes()), "a.txt"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 200, r.data
+
+    import local_rag_api as mod
+    store, _, _, _ = mod.get_store("fake:any", "vtest")
+    metas = store._collection.get(include=["metadatas"])["metadatas"]
+    assert metas
+    assert all(m["folder"] == str(docdir.resolve()) for m in metas)
+
 def test_answer_accepts_history_and_forwards_to_llm(client, tmp_path):
     content = b"Smitheries covered by the BREF have hammers exceeding 50 kilojoule."
     r = client.post(
@@ -432,3 +456,42 @@ def test_retrieval_query_leaves_self_contained_followup_alone():
     q = "What is the boiling point of benzene?"
     assert _retrieval_query(q, history) == q
     assert _retrieval_query(q, []) == q
+
+
+def test_backfill_adds_folder_without_re_embedding(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    store, _, cname, _ = mod.get_store("fake:any", "vtest")
+    coll = store._collection
+    coll.add(
+        ids=["legacy-1"],
+        embeddings=[[0.25] * 128],
+        documents=["legacy chunk written before the folder key existed"],
+        metadatas=[{"source_path": "/data/reports/old.pdf", "page": 1, "chunk": 0}],
+    )
+    before = list(coll.get(ids=["legacy-1"], include=["embeddings"])["embeddings"][0])
+
+    updated = mod._backfill_folder_metadata(store, cname)
+
+    assert updated == 1
+    md = coll.get(ids=["legacy-1"], include=["metadatas"])["metadatas"][0]
+    assert md["folder"] == "/data/reports"
+    assert md["page"] == 1
+    after = list(coll.get(ids=["legacy-1"], include=["embeddings"])["embeddings"][0])
+    assert after == before
+
+
+def test_backfill_is_idempotent(tmp_path):
+    app = _make_app(tmp_path)  # noqa: F841
+    import local_rag_api as mod
+
+    store, _, cname, _ = mod.get_store("fake:any", "vtest")
+    store._collection.add(
+        ids=["legacy-2"],
+        embeddings=[[0.5] * 128],
+        documents=["another legacy chunk"],
+        metadatas=[{"source_path": "/data/reports/old2.pdf", "chunk": 0}],
+    )
+    assert mod._backfill_folder_metadata(store, cname) == 1
+    assert mod._backfill_folder_metadata(store, cname) == 0
