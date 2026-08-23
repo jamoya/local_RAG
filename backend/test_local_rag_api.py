@@ -893,3 +893,43 @@ def test_watch_upsert_skips_a_file_it_already_ingested_unchanged(tmp_path):
         mod._ingest_local_file = real
 
     assert len(calls) == 1
+
+
+class _BatchLimitedCollection:
+    """Chroma rejects any single write larger than its max batch size."""
+
+    def __init__(self, n_rows: int, max_batch: int):
+        self.max_batch = max_batch
+        self._metas = {f"c{i}": {"source_path": "/data/reports/old.pdf"} for i in range(n_rows)}
+        self.update_batches = []
+
+    def get(self, include=None, limit=None, offset=0):
+        ids = list(self._metas)[offset: offset + limit]
+        return {"ids": ids, "metadatas": [dict(self._metas[i]) for i in ids]}
+
+    def update(self, ids, metadatas):
+        if len(ids) > self.max_batch:
+            raise ValueError(
+                f"Batch size of {len(ids)} is greater than max batch size of {self.max_batch}"
+            )
+        self.update_batches.append(len(ids))
+        for cid, md in zip(ids, metadatas):
+            self._metas[cid].update(md)
+
+
+class _BatchLimitedStore:
+    def __init__(self, n_rows: int, max_batch: int):
+        self._collection = _BatchLimitedCollection(n_rows, max_batch)
+        self._client = type("C", (), {"get_max_batch_size": staticmethod(lambda: max_batch)})()
+
+
+def test_backfill_respects_chroma_max_batch_size():
+    """A collection larger than one batch must be backfilled in several writes."""
+    from local_rag_api import _backfill_folder_metadata
+
+    store = _BatchLimitedStore(n_rows=12000, max_batch=5461)
+
+    updated = _backfill_folder_metadata(store, "cname-batch-limit")
+
+    assert updated == 12000
+    assert max(store._collection.update_batches) <= 5461

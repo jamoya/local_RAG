@@ -487,8 +487,14 @@ def _backfill_folder_metadata(store: Any, cname: str) -> int:
     if coll is None:
         return 0
 
+    # Chroma refuses a write larger than its max batch size (a SQLite variable
+    # limit, 5461 on this build), so page at that size and update one page at a
+    # time -- a 10k page made every backfill of a large collection raise.
+    client = getattr(store, "_client", None)
+    page = client.get_max_batch_size() if client is not None else 5000
+
     updated = 0
-    offset, page = 0, 10000
+    offset = 0
     while True:
         got = coll.get(include=["metadatas"], limit=page, offset=offset)
         ids = got.get("ids") or []
