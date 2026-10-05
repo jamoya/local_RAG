@@ -16,7 +16,7 @@ Notes
 Examples
 --------
 python launch_modified.py --query "When automatic electricity systems will have to be available?" --llm-id openai:gpt-4o-mini
-python launch_modified.py --query "When automatic electricity systems will have to be available?" --llm-id ollama:llama3.2
+python launch_modified.py --query "When automatic electricity systems will have to be available?" --llm-id ollama:qwen3:30b
 
 python launch_modified.py --query "What are the reported 'cross-media effects' of using 'wet scrubbers' for dust capture in cupola systems compared to dry systems?" --llm-id openai:gpt-4o-mini
 python launch_modified.py --query "Summarize CBAM" --llm-id openai:gpt-4o-mini

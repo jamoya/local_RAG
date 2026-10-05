@@ -17,9 +17,8 @@ _Generated 2026-08-09. Based on the models actually found installed in Ollama (`
 | Model | Size | Type / role |
 |---|---|---|
 | `qwen3:30b` | 17.3 GB | MoE generator (~3B active) |
-| `gpt-oss:20b` (= `gpt-oss:latest`) | 12.8 GB | MoE reasoning generator |
+| `gpt-oss:latest` | 12.8 GB | MoE reasoning generator |
 | `gemma4:31b-mlx` | 17.4 GB | Dense generator (MLX quant) |
-| `llama3.2:latest` | 1.9 GB | Small generator (~3B) |
 | `deepseek-r1:1.5b` | 1.0 GB | Tiny reasoning distill |
 | `nomic-embed-text:v1.5` | 262 MB | **Embedding model** |
 | `qllama/bge-m3` | 605 MB | **Embedding model** |
@@ -44,7 +43,7 @@ _Generated 2026-08-09. Based on the models actually found installed in Ollama (`
 |---|---|---|---|
 | 1 | **`bge-m3`** (`qllama/bge-m3`) | Ollama | **Retriever / embeddings** |
 | 2 | **`qwen3:30b`** (Qwen3-30B-A3B) | Ollama | **Primary generator** |
-| 3 | **`gpt-oss:20b`** | Ollama | Reasoning / alternate generator |
+| 3 | **`gpt-oss:latest`** | Ollama | Reasoning / alternate generator |
 | 4 | **`gemma-4-12B-it-QAT`** | LM Studio | Lightweight / fast generator |
 
 ### Line of thinking
@@ -53,16 +52,15 @@ RAG quality is bounded first by **retrieval**, then by the generator's **faithfu
 
 - **`bge-m3` as the retriever.** The single most impactful choice. It's the 2026 default production retriever: MIT-licensed, 100+ languages, 8K context, and it produces *dense + sparse + multi-vector* representations in one model — meaning it can drive hybrid search (semantic + keyword) from a single embedder. `nomic-embed-text` is a fine, lighter fallback, but bge-m3 retrieves better, which is where RAG lives or dies.
 - **`qwen3:30b` (Qwen3-30B-A3B) as primary generator.** The consensus RAG sweet spot for local machines. It's a Mixture-of-Experts model with only ~3B active parameters, so it answers with the quality of a much larger model but at the *speed* of a small one — ideal when each query stuffs thousands of tokens of retrieved context into the prompt. Very long context and strong instruction-following make it stick to the sources.
-- **`gpt-oss:20b` as the reasoning option.** MoE, efficient, and stronger at multi-step synthesis when a query needs the model to reason *over* several retrieved chunks (comparisons, "why", multi-hop). Good open-weight second opinion alongside Qwen.
+- **`gpt-oss:latest` as the reasoning option.** MoE, efficient, and stronger at multi-step synthesis when a query needs the model to reason *over* several retrieved chunks (comparisons, "why", multi-hop). Good open-weight second opinion alongside Qwen.
 - **`gemma-4-12B-it-QAT` as the fast/light generator.** QAT 4-bit at 6.5 GB leaves plenty of memory for the vector store + embedding model + KV cache. Good grounding, long context, and it's multimodal (the `mmproj` file) — useful if you later want to RAG over screenshots/diagrams. Pick this when you want snappy answers or to run everything comfortably alongside other apps.
 
 ### Why not the others
 - **`dolphin-70b` (38 GB):** highest raw quality but heavy and slow per query; "uncensored" fine-tunes add nothing for grounded document QA. Keep as a "hard question" fallback, not the default.
 - **`Magistral-Small` / `deepseek-r1:1.5b`:** reasoning-tuned models tend to *over-think* and drift from the sources in RAG, hurting faithfulness; r1:1.5b is also too small to synthesize reliably.
-- **`llama3.2:3b`:** great for speed tests, but weaker grounding than Gemma-12B at a small memory saving.
 - **`gemma4:31b-mlx`, `Qwen3.6-27B`:** solid but redundant given Qwen3-30B and Gemma-12B already cover the quality/speed spread. Qwen3.6-27B is a good multimodal alternative to Gemma if you need bigger.
 
-**Recommended default stack:** `bge-m3` (retrieve) → `qwen3:30b` (generate), with `gemma-4-12B` for speed and `gpt-oss:20b` for hard reasoning queries.
+**Recommended default stack:** `bge-m3` (retrieve) → `qwen3:30b` (generate), with `gemma-4-12B` for speed and `gpt-oss:latest` for hard reasoning queries.
 
 ---
 
@@ -106,7 +104,7 @@ This sets up a minimal but complete RAG pipeline: **ingest → embed → store �
 - **Ollama** running (it already is — the models are there). Start the server if needed:
   ```bash
   ollama serve            # runs on http://localhost:11434
-  ollama list             # confirm bge-m3, qwen3:30b, gpt-oss:20b are present
+  ollama list             # confirm bge-m3, qwen3:30b, gpt-oss:latest are present
   ```
 - **`uv`** installed. If not:
   ```bash
@@ -198,7 +196,7 @@ embeddings = OllamaEmbeddings(model="qllama/bge-m3")
 store = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
 retriever = store.as_retriever(search_kwargs={"k": 5})
 
-# Primary generator: Qwen3-30B-A3B. Swap to "gpt-oss:20b" for hard reasoning.
+# Primary generator: Qwen3-30B-A3B. Swap to "gpt-oss:latest" for hard reasoning.
 llm = ChatOllama(model="qwen3:30b", temperature=0.1)
 
 prompt = ChatPromptTemplate.from_template(
@@ -292,7 +290,7 @@ once, then ~0.39 s at 12 candidates and ~0.64 s at 24.
 Documents ──► chunk ──► bge-m3 (embed) ──► Chroma (store)
 Query ──► bge-m3 (embed) ──► Chroma (top-k) ──► [reranker] ──► qwen3:30b (answer)
                                                               └► fast: gemma-4-12B
-                                                              └► reasoning: gpt-oss:20b
+                                                              └► reasoning: gpt-oss:latest
 ```
 
 All local, all offline, all `uv run`.
@@ -303,7 +301,7 @@ As shipped in this repo:
 |---|---|
 | Embed | `EMBEDDING_ID=ollama:qllama/bge-m3:latest` (`scripts/run_bge_m3.sh`); alternative `hf:Qwen/Qwen3-Embedding-0.6B` |
 | Rerank | `RERANKER_ID=ce:BAAI/bge-reranker-v2-m3` (default `none:`) |
-| Generate | `llm_id=ollama:qwen3:30b`, `ollama:gpt-oss:20b`, or `lmstudio:google/gemma-4-12b-qat` |
+| Generate | `llm_id=ollama:qwen3:30b`, `ollama:gpt-oss:latest`, or `lmstudio:google/gemma-4-12b-qat` |
 
 Switching `EMBEDDING_ID` creates a *new* Chroma collection rather than mixing vectors, so changing embedder means
 re-ingesting. Keep it consistent between the API and `folder_watcher.py`.

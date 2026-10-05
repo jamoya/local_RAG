@@ -775,7 +775,7 @@ def test_launch_build_llm_id_explicit():
     assert launch_mod.build_llm_id("openai:gpt-4o-mini", None, None) == "openai:gpt-4o-mini"
 
 def test_launch_build_llm_id_provider_model():
-    assert launch_mod.build_llm_id(None, "ollama", "llama3.2") == "ollama:llama3.2"
+    assert launch_mod.build_llm_id(None, "ollama", "qwen3:30b") == "ollama:qwen3:30b"
 
 def test_launch_build_llm_id_default(monkeypatch):
     monkeypatch.delenv("LLM_ID", raising=False)
@@ -829,7 +829,7 @@ def test_gpt_5_6_models_get_the_wide_context_preset():
 
 def test_other_models_get_the_modest_context_preset():
     for model in ("openai:gpt-4o-mini", "anthropic:claude-sonnet-4-6",
-                  "ollama:llama3.2", "mock:any", "", None):
+                  "ollama:qwen3:30b", "mock:any", "", None):
         assert ga.context_preset(model) == ga.MODEST_CONTEXT_PRESET, model
 
 

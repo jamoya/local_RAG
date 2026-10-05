@@ -49,9 +49,8 @@ MODEL_CHOICES = [
     "anthropic:claude-opus-4-7",
     # Local generators served by Ollama.
     "ollama:qwen3:30b",
-    "ollama:gpt-oss:20b",
+    "ollama:gpt-oss:latest",
     "ollama:gemma4:31b-mlx",
-    "ollama:llama3.2",
     # Local generators served by LM Studio (needs its server started).
     "lmstudio:google/gemma-4-12b-qat",
     "lmstudio:qwen/qwen3.6-27b",
